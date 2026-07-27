@@ -30,7 +30,6 @@ class FollowerConfig:
     deviation: int = 20
     magic: int = 951001
     symbol_mapping: dict[str, str] = field(default_factory=dict)
-    portable_path: str = ""  # Separate MT5 copy for this follower; if empty, auto-derived
 
 
 @dataclass
@@ -79,7 +78,6 @@ class Config:
             deviation=int(data.get("deviation", 20)),
             magic=int(data.get("magic", 951001)),
             symbol_mapping={k.upper(): v for k, v in data.get("symbol_mapping", {}).items()},
-            portable_path=data.get("portable_path", ""),
         )
         self.followers.append(f)
         return f
@@ -113,8 +111,6 @@ class Config:
                     f.magic = int(data["magic"])
                 if "symbol_mapping" in data:
                     f.symbol_mapping = {k.upper(): v for k, v in data["symbol_mapping"].items()}
-                if "portable_path" in data:
-                    f.portable_path = data["portable_path"]
                 return f
         return None
 
@@ -163,7 +159,6 @@ def follower_to_safe_dict(f: FollowerConfig) -> dict:
         "deviation": f.deviation,
         "magic": f.magic,
         "symbol_mapping": dict(f.symbol_mapping),
-        "portable_path": f.portable_path,
     }
 
 
