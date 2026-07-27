@@ -7,6 +7,7 @@ import json
 import logging
 import random
 import time
+import urllib.parse
 from typing import Optional
 
 import aiohttp
@@ -49,6 +50,26 @@ class AgentClient:
                 await self._connect_and_listen()
             except asyncio.CancelledError:
                 break
+            except aiohttp.ClientConnectorDNSError:
+                logger.error(
+                    "Cannot resolve hub hostname '%s'. "
+                    "Check that:\n"
+                    "  1. The hub IP/hostname in agent_config.yaml is correct\n"
+                    "  2. If using Tailscale: Tailscale is connected on THIS machine\n"
+                    "  3. The hub IP is reachable (try: ping <hub_ip>)",
+                    self._hub_url
+                )
+            except aiohttp.ClientConnectorError:
+                logger.error(
+                    "Cannot connect to hub at %s. "
+                    "Check that:\n"
+                    "  1. The hub server is running on the master machine\n"
+                    "  2. Port 5000 is not blocked by a firewall\n"
+                    "  3. If using Tailscale: both machines are on the same tailnet",
+                    self._hub_url
+                )
+            except asyncio.TimeoutError:
+                logger.error("Connection to hub timed out — check network and firewall")
             except Exception:
                 logger.exception("Connection error")
 
@@ -67,8 +88,8 @@ class AgentClient:
     # ------------------------------------------------------------------
 
     async def _connect_and_listen(self) -> None:
-        ws_url = f"{self._hub_url.replace('http://', 'ws://').replace('https://', 'wss://')}/ws/agent?name={self._agent_name}"
-        logger.info("Connecting to hub: %s", ws_url)
+        ws_url = f"{self._hub_url.replace('http://', 'ws://').replace('https://', 'wss://')}/ws/agent?name={urllib.parse.quote(self._agent_name, safe='')}"
+        logger.info("Connecting to hub: %s", ws_url.replace(self._agent_name, '[hidden]'))
 
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()

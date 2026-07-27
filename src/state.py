@@ -141,6 +141,7 @@ class SharedState:
         self.known_tickets: set[int] = set()
         self.equity_history = EquityHistory()
         self.activity = ActivityLog()
+        self.follower_states: dict[str, dict] = {}
 
     # ── Master ────────────────────────────────────────────────
 
@@ -157,6 +158,46 @@ class SharedState:
     def get_master_account(self) -> dict:
         with self._lock:
             return dict(self.master_account)
+
+    # ── Local Followers ────────────────────────────────────────
+
+    def follower_states_snapshot(self) -> dict[str, dict]:
+        with self._lock:
+            return {k: dict(v) for k, v in self.follower_states.items()}
+
+    def set_follower_active(self, name: str, active: bool) -> None:
+        with self._lock:
+            s = self.follower_states.setdefault(name, {})
+            s["active"] = active
+            s["name"] = name
+            if not active:
+                s["connected"] = False
+
+    def register_follower_connection(self, name: str, login: int, server: str, balance: float, equity: float) -> None:
+        with self._lock:
+            s = self.follower_states.setdefault(name, {})
+            s["name"] = name
+            s["connected"] = True
+            s["login"] = login
+            s["server"] = server
+            s["balance"] = balance
+            s["equity"] = equity
+            s["active_since"] = time.time()
+
+    def record_follower_event(self, name: str, success: bool) -> None:
+        with self._lock:
+            s = self.follower_states.get(name)
+            if not s:
+                return
+            s["events_total"] = s.get("events_total", 0) + 1
+            s["events_ok"] = s.get("events_ok", 0) + (1 if success else 0)
+            s["events_fail"] = s.get("events_fail", 0) + (0 if success else 1)
+
+    def record_follower_error(self, name: str) -> None:
+        with self._lock:
+            s = self.follower_states.get(name)
+            if s:
+                s["errors"] = s.get("errors", 0) + 1
 
     # ── Agents ────────────────────────────────────────────────
 

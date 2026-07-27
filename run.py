@@ -114,8 +114,11 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # ── Create bridge ────────────────────────────────────────
+    bridge = CopyTradeBridge(cfg, state, event_queue, loop)
+
     # ── Create aiohttp app ────────────────────────────────────
-    app = create_app(state, event_queue, cfg, config_path)
+    app = create_app(state, event_queue, cfg, config_path, bridge)
     runner = web.AppRunner(app)
 
     async def start_server():
@@ -127,8 +130,7 @@ def main() -> None:
         except Exception as e:
             logger.error("Failed to start dashboard server: %s", e, exc_info=True)
 
-    # ── Start bridge in a thread ──────────────────────────────
-    bridge = CopyTradeBridge(cfg, state, event_queue, loop)
+    # ── Start bridge thread ──────────────────────────────────
     bridge_thread = threading.Thread(target=bridge.run, daemon=True, name="bridge")
     bridge_thread.start()
     logger.info("Bridge thread started")

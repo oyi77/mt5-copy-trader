@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 def _event_to_dict(event) -> dict:
     """Serialize TradeEvent to dict for JSON transmission."""
-    return {
+    d = {
         "action": event.action,
         "symbol": event.symbol,
         "volume": event.volume,
@@ -32,13 +32,19 @@ def _event_to_dict(event) -> dict:
         "magic": event.magic,
         "prev_volume": event.prev_volume,
     }
+    if event.order_type is not None:
+        d["order_type"] = event.order_type
+    if event.expiration is not None:
+        d["expiration"] = event.expiration
+    return d
 
 
 class CopyTradeBridge:
     """Main loop: poll master → detect changes → update state + queue.
 
     Runs in a dedicated thread. Puts trade events on asyncio.Queue for the
-    hub to broadcast to connected agents.
+    hub to broadcast to connected agents. Also executes trades on any
+    activated local followers.
     """
 
     def __init__(
@@ -54,6 +60,9 @@ class CopyTradeBridge:
         self._loop = loop
         self._master = MasterMonitor(config.master)
         self._running = False
+        self._active_followers: dict[str, FollowerExecutor] = {}
+        self._activation_results: dict[str, tuple[bool, str]] = {}
+        self._activation_pending: list[str] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -76,6 +85,8 @@ class CopyTradeBridge:
         self._running = True
         while self._running:
             try:
+                # Process any pending follower activations from the API
+                self._process_pending_activations()
                 self._tick()
             except Exception:
                 logger.exception("Bridge cycle error")
@@ -83,9 +94,135 @@ class CopyTradeBridge:
                 time.sleep(2.0)
 
         self._log_shutdown()
+        self._deactivate_all()
 
     def stop(self) -> None:
         self._running = False
+
+    # ------------------------------------------------------------------
+    # Local Follower Management (queue-based — MT5 calls run in bridge thread)
+    # ------------------------------------------------------------------
+
+    def activate_follower(self, name: str) -> tuple[bool, str]:
+        """Queue activation for the bridge thread. Returns previous result if any."""
+        # Check if already active
+        if name in self._active_followers:
+            return False, f"Follower '{name}' is already active"
+
+        # Find config
+        cfg = None
+        for fc in self._cfg.followers:
+            if fc.name == name:
+                cfg = fc
+                break
+        if cfg is None:
+            return False, f"Follower '{name}' not found in config"
+
+        # Check if activation already pending
+        if name in self._activation_pending:
+            return False, f"Follower '{name}' activation already in progress"
+
+        # Queue for bridge thread
+        self._activation_pending.append(name)
+        # Remove any stale result
+        self._activation_results.pop(name, None)
+        return True, f"Follower '{name}' activation queued"
+
+    def check_activation(self, name: str) -> Optional[tuple[bool, str]]:
+        """Check if activation completed. Returns None if still pending."""
+        return self._activation_results.get(name)
+
+    def _process_pending_activations(self) -> None:
+        """Bridge thread: process queued activations one per cycle."""
+        if not self._activation_pending:
+            return
+        name = self._activation_pending.pop(0)
+        logger.info("Processing queued activation for '%s'...", name)
+
+        # Find config
+        cfg = next((fc for fc in self._cfg.followers if fc.name == name), None)
+        if cfg is None:
+            self._activation_results[name] = (False, f"Follower '{name}' not found")
+            return
+
+        executor = FollowerExecutor(cfg, master_port=self._cfg.master.port)
+
+        # Launch MT5 terminal
+        launched = executor.launch_terminal()
+        if not launched:
+            self._activation_results[name] = (False, f"Failed to launch MT5 terminal for '{name}'")
+            return
+
+        # Connect with login credentials
+        if not executor.connect(master_port=self._cfg.master.port):
+            self._activation_results[name] = (False, f"MT5 connect failed for '{name}'")
+            return
+
+        # Verify we're logged into the right account (safety check)
+        try:
+            acc = mt5.account_info()
+            if not acc:
+                executor.disconnect()
+                self._activation_results[name] = (False, f"MT5 connected but no account info for '{name}'")
+                return
+            if acc.login != cfg.login:
+                logger.warning(
+                    "%s: connected to login %d instead of configured %d — forcing relogin",
+                    name, acc.login, cfg.login,
+                )
+                mt5.shutdown()
+                if not executor.connect(master_port=self._cfg.master.port):
+                    self._activation_results[name] = (False, f"Failed to relogin for '{name}'")
+                    return
+                acc = mt5.account_info()
+
+            self._state.register_follower_connection(
+                name, acc.login, acc.server, acc.balance, acc.equity
+            )
+            logger.info(
+                "%s: logged in as %d@%s (balance=%.2f %s)",
+                name, acc.login, acc.server, acc.balance, acc.currency,
+            )
+        except Exception as e:
+            executor.disconnect()
+            self._activation_results[name] = (False, f"Account verification failed for '{name}': {e}")
+            return
+        finally:
+            executor.disconnect()
+
+        self._active_followers[name] = executor
+        self._state.set_follower_active(name, True)
+        self._activation_results[name] = (True, f"Follower '{name}' activated")
+        logger.info("Follower '%s' activated (MT5 port %d)", name, cfg.port)
+
+    def deactivate_follower(self, name: str) -> tuple[bool, str]:
+        """Stop following for a local follower."""
+        executor = self._active_followers.pop(name, None)
+        if executor is None:
+            return False, f"Follower '{name}' is not active"
+
+        try:
+            executor.disconnect()
+        except Exception:
+            pass
+
+        self._state.set_follower_active(name, False)
+        logger.info("Follower '%s' deactivated", name)
+        return True, f"Follower '{name}' deactivated"
+
+    def get_active_followers(self) -> dict[str, dict]:
+        """Return status dict for all active followers."""
+        result = {}
+        for name, ex in self._active_followers.items():
+            try:
+                result[name] = ex.get_status()
+            except Exception as e:
+                result[name] = {"name": name, "active": True, "connected": False, "error": str(e)}
+        return result
+
+    def _deactivate_all(self) -> None:
+        for name in list(self._active_followers.keys()):
+            self.deactivate_follower(name)
 
     # ------------------------------------------------------------------
     # Cycle
@@ -102,6 +239,7 @@ class CopyTradeBridge:
 
         try:
             positions = self._master.poll()
+            orders = self._master.poll_orders()
             account = self._get_account_info()
         finally:
             self._master.disconnect()
@@ -111,14 +249,15 @@ class CopyTradeBridge:
         # 2. Update master state for dashboard
         self._update_master_state(positions, account)
 
-        # 3. Detect changes
+        # 3. Detect changes (positions + orders)
         events = self._master.detect_changes(positions)
+        events += self._master.detect_order_changes(orders)
 
         if not events:
             time.sleep(self._cfg.poll_interval_ms / 1000.0)
             return
 
-        # 4. Record + broadcast events
+        # 4. Record + broadcast events (existing — for remote agents)
         self._state.update_stats(
             events_detected=self._state.stats.events_detected + len(events),
             last_event_time=time.time(),
@@ -133,11 +272,28 @@ class CopyTradeBridge:
                 event.master_ticket,
             )
 
-        # Put events on the queue for broadcast to agents
+        # Put events on the queue for broadcast to remote agents
         dict_events = [_event_to_dict(e) for e in events]
         self._loop.call_soon_threadsafe(self._queue.put_nowait, dict_events)
 
+        # 5. Execute on active local followers
+        if self._active_followers:
+            self._execute_on_followers(events)
+
         time.sleep(0.1)
+
+    def _execute_on_followers(self, events: list) -> None:
+        """Execute trade events on all active local followers."""
+        for name, executor in list(self._active_followers.items()):
+            try:
+                for event in events:
+                    success = executor.execute(event)
+                    self._state.record_follower_event(name, success)
+                    if not success:
+                        logger.warning("%s: event %s %s failed", name, event.action, event.symbol)
+            except Exception as e:
+                logger.error("%s: execution error: %s", name, e)
+                self._state.record_follower_error(name)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -150,10 +306,11 @@ class CopyTradeBridge:
             return
         try:
             positions = self._master.poll()
-            self._master.snapshot(positions)
+            orders = self._master.poll_orders()
+            self._master.snapshot(positions, orders)
             account = self._get_account_info()
             self._update_master_state(positions, account)
-            logger.info("Master snapshot: %d positions", len(positions))
+            logger.info("Master snapshot: %d positions, %d pending orders", len(positions), len(orders))
         finally:
             self._master.disconnect()
 

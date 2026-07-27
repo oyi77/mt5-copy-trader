@@ -9,7 +9,7 @@ from typing import Optional
 import MetaTrader5 as mt5
 
 from src.config import MasterConfig
-from src.models import Position, TradeEvent
+from src.models import Position, PendingOrder, TradeEvent
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,8 @@ class MasterMonitor:
         self._cfg = config
         self._snapshot: dict[int, Position] = {}  # ticket -> Position
         self._known_tickets: set[int] = set()      # tickets we've copied
+        self._order_snapshot: dict[int, PendingOrder] = {}
+        self._known_order_tickets: set[int] = set()
 
     @property
     def known_tickets(self) -> set[int]:
@@ -44,10 +46,21 @@ class MasterMonitor:
             return []
         return [Position.from_mt5(p) for p in positions]
 
-    def snapshot(self, positions: list[Position]) -> None:
-        """Set initial snapshot — positions that existed before bridge started."""
+    def poll_orders(self) -> list[PendingOrder]:
+        """Fetch all pending orders from master. Returns empty list on error."""
+        orders = mt5.orders_get()
+        if orders is None:
+            logger.warning("Master orders_get returned None: %s", mt5.last_error())
+            return []
+        return [PendingOrder.from_mt5(o) for o in orders]
+
+    def snapshot(self, positions: list[Position], orders: list[PendingOrder] | None = None) -> None:
+        """Set initial snapshot — positions and orders that existed before bridge started."""
         self._snapshot = {p.ticket: p for p in positions}
         logger.info("Master snapshot: %d positions (will not auto-copy)", len(self._snapshot))
+        if orders is not None:
+            self._order_snapshot = {o.ticket: o for o in orders}
+            logger.info("Master order snapshot: %d pending orders", len(self._order_snapshot))
 
     def detect_changes(self, current: list[Position]) -> list[TradeEvent]:
         """
@@ -121,6 +134,81 @@ class MasterMonitor:
         self._snapshot = curr_by_ticket
         return events
 
+    def detect_order_changes(self, current: list[PendingOrder]) -> list[TradeEvent]:
+        """Detect new, removed, or modified pending orders."""
+        events: list[TradeEvent] = []
+        curr_by_ticket = {o.ticket: o for o in current}
+        prev_by_ticket = dict(self._order_snapshot)
+
+        # --- NEW PENDING ORDERS (place) ---
+        for ticket, order in curr_by_ticket.items():
+            if ticket not in prev_by_ticket:
+                if ticket not in self._known_order_tickets:
+                    events.append(TradeEvent(
+                        action="place",
+                        symbol=order.symbol,
+                        volume=order.volume,
+                        price=order.price,
+                        sl=order.sl if order.sl else None,
+                        tp=order.tp if order.tp else None,
+                        master_ticket=ticket,
+                        position_type=order.type,
+                        comment=order.comment,
+                        magic=order.magic,
+                        order_type=order.type,
+                        expiration=order.expiration if order.expiration else None,
+                    ))
+                    self._known_order_tickets.add(ticket)
+
+        # --- REMOVED PENDING ORDERS (delete) ---
+        for ticket, order in prev_by_ticket.items():
+            if ticket not in curr_by_ticket:
+                if ticket in self._known_order_tickets:
+                    events.append(TradeEvent(
+                        action="delete",
+                        symbol=order.symbol,
+                        volume=order.volume,
+                        price=order.price,
+                        sl=order.sl if order.sl else None,
+                        tp=order.tp if order.tp else None,
+                        master_ticket=ticket,
+                        position_type=order.type,
+                        comment=order.comment,
+                        magic=order.magic,
+                        order_type=order.type,
+                    ))
+                    self._known_order_tickets.discard(ticket)
+
+        # --- MODIFIED PENDING ORDERS (modify_order) ---
+        for ticket, curr in curr_by_ticket.items():
+            if ticket in prev_by_ticket and ticket in self._known_order_tickets:
+                prev = prev_by_ticket[ticket]
+                changed = (
+                    curr.price != prev.price or
+                    curr.sl != prev.sl or
+                    curr.tp != prev.tp or
+                    curr.volume != prev.volume or
+                    curr.expiration != prev.expiration
+                )
+                if changed:
+                    events.append(TradeEvent(
+                        action="modify_order",
+                        symbol=curr.symbol,
+                        volume=curr.volume,
+                        price=curr.price,
+                        sl=curr.sl if curr.sl else None,
+                        tp=curr.tp if curr.tp else None,
+                        master_ticket=ticket,
+                        position_type=curr.type,
+                        comment=curr.comment,
+                        magic=curr.magic,
+                        order_type=curr.type,
+                        expiration=curr.expiration if curr.expiration else None,
+                    ))
+
+        self._order_snapshot = curr_by_ticket
+        return events
+
     def run_once(self) -> list[TradeEvent]:
         """Full poll-detect cycle. Returns events to execute."""
         if not self.connect():
@@ -130,6 +218,9 @@ class MasterMonitor:
 
         try:
             positions = self.poll()
-            return self.detect_changes(positions)
+            orders = self.poll_orders()
+            events = self.detect_changes(positions)
+            events += self.detect_order_changes(orders)
+            return events
         finally:
             self.disconnect()

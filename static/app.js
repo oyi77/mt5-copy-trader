@@ -72,6 +72,10 @@
       downloadAgent(name);
     } else if (action === 'delete-follower') {
       deleteFollower(name);
+    } else if (action === 'activate-follower') {
+      activateFollower(name);
+    } else if (action === 'deactivate-follower') {
+      deactivateFollower(name);
     }
   });
 
@@ -564,20 +568,71 @@
   function renderFollowers(followers) {
     var c = $('followers-list');
     if (!followers || !followers.length) { c.innerHTML = '<p style="color:var(--text-dim);padding:12px 0">No followers configured.</p>'; return; }
-    var html = '';
-    for (var i = 0; i < followers.length; i++) {
-      var f = followers[i];
-      var name = escHtml(f.name);
-      html += '<div class="follower-card"><div class="fh"><h4>'+name+'</h4><div class="fa">'+
-        '<button class="btn btn-sm" data-toggle="edit-follower" data-fname="'+name+'">Edit</button>'+
-        '<button class="btn btn-sm" data-toggle="download-agent" data-fname="'+name+'">Download</button>'+
-        '<button class="btn btn-sm btn-danger" data-toggle="delete-follower" data-fname="'+name+'">Delete</button>'+
-        '</div></div><div class="fd">'+
-        '<span>Login: '+(f.login||'\u2014')+'</span><span>Server: '+(f.server||'\u2014')+'</span>'+
-        '<span>Lot: '+(f.lot_multiplier||1)+'x</span><span>Port: '+(f.port||'\u2014')+'</span>'+
-        '<span>'+(f.has_password?'OK pw':'NO pw')+'</span></div></div>';
-    }
-    c.innerHTML = html;
+
+    // Get follower runtime status
+    fetch('/api/followers/status').then(function(r){return r.json()}).then(function(statusData){
+      var statusMap = {};
+      if (statusData && statusData.followers) {
+        for (var si = 0; si < statusData.followers.length; si++) {
+          var s = statusData.followers[si];
+          statusMap[s.name] = s;
+        }
+      }
+
+      var html = '';
+      for (var i = 0; i < followers.length; i++) {
+        var f = followers[i];
+        var name = escHtml(f.name);
+        var st = statusMap[f.name] || {};
+        var active = st.active;
+        var connected = st.connected;
+        var errCount = st.errors || 0;
+        var evOk = st.events_ok || 0;
+        var evFail = st.events_fail || 0;
+
+        var statusLabel, statusDot;
+        if (connected) { statusLabel = 'Running'; statusDot = 'green'; }
+        else if (active) { statusLabel = 'Starting...'; statusDot = 'yellow'; }
+        else { statusLabel = 'Stopped'; statusDot = 'red'; }
+
+        html += '<div class="follower-card">';
+        html += '<div class="fh"><h4>'+name+' <span class="dot '+statusDot+'"></span> <span style="font-size:11px;color:var(--text-dim)">'+statusLabel+'</span></h4>';
+        html += '<div class="fa">';
+        if (active) {
+          html += '<button class="btn btn-sm btn-danger" data-toggle="deactivate-follower" data-fname="'+name+'">Stop</button>';
+        } else {
+          html += '<button class="btn btn-sm btn-primary" data-toggle="activate-follower" data-fname="'+name+'">Start</button>';
+        }
+        html += '<button class="btn btn-sm" data-toggle="edit-follower" data-fname="'+name+'">Edit</button>'+
+          '<button class="btn btn-sm" data-toggle="download-agent" data-fname="'+name+'">Download</button>'+
+          '<button class="btn btn-sm btn-danger" data-toggle="delete-follower" data-fname="'+name+'">Delete</button>';
+        html += '</div></div><div class="fd">';
+        html += '<span>Login: '+(f.login||'\u2014')+'</span><span>Server: '+(f.server||'\u2014')+'</span>';
+        html += '<span>Lot: '+(f.lot_multiplier||1)+'x</span><span>Port: '+(f.port||'\u2014')+'</span>';
+        html += '<span>'+(f.has_password?'OK pw':'NO pw')+'</span>';
+        if (st.portable_path) html += '<span>Portable: '+escHtml(st.portable_path)+'</span>';
+        else if (f.portable_path) html += '<span>Portable: '+escHtml(f.portable_path)+'</span>';
+        if (active) html += '<span>Events OK: '+evOk+'</span><span>Errors: '+errCount+'</span>';
+        html += '</div></div>';
+      }
+      c.innerHTML = html;
+    }).catch(function(){
+      // Fallback: render without status
+      var html = '';
+      for (var i = 0; i < followers.length; i++) {
+        var f = followers[i];
+        var name = escHtml(f.name);
+        html += '<div class="follower-card"><div class="fh"><h4>'+name+'</h4><div class="fa">'+
+          '<button class="btn btn-sm" data-toggle="edit-follower" data-fname="'+name+'">Edit</button>'+
+          '<button class="btn btn-sm" data-toggle="download-agent" data-fname="'+name+'">Download</button>'+
+          '<button class="btn btn-sm btn-danger" data-toggle="delete-follower" data-fname="'+name+'">Delete</button>'+
+          '</div></div><div class="fd">'+
+          '<span>Login: '+(f.login||'\u2014')+'</span><span>Server: '+(f.server||'\u2014')+'</span>'+
+          '<span>Lot: '+(f.lot_multiplier||1)+'x</span><span>Port: '+(f.port||'\u2014')+'</span>'+
+          '<span>'+(f.has_password?'OK pw':'NO pw')+'</span></div></div>';
+      }
+      c.innerHTML = html;
+    });
   }
 
   window.showAddFollower = function() {
@@ -672,6 +727,24 @@
     fetch('/api/config/followers/'+encodeURIComponent(name),{method:'DELETE'}).then(function() {
       toast('Deleted'); loadConfig();
     });
+  }
+
+  function activateFollower(name) {
+    fetch('/api/followers/'+encodeURIComponent(name)+'/activate',{method:'POST'}).then(function(r) {
+      return r.json();
+    }).then(function(j) {
+      if (j.status === 'ok') { toast('Follower started: '+j.message); loadConfig(); }
+      else toast(j.message||'Activation failed','error');
+    }).catch(function(e) { toast(e.message,'error'); });
+  }
+
+  function deactivateFollower(name) {
+    fetch('/api/followers/'+encodeURIComponent(name)+'/deactivate',{method:'POST'}).then(function(r) {
+      return r.json();
+    }).then(function(j) {
+      if (j.status === 'ok') { toast('Follower stopped: '+j.message); loadConfig(); }
+      else toast(j.message||'Deactivation failed','error');
+    }).catch(function(e) { toast(e.message,'error'); });
   }
 
   function downloadAgent(name) {

@@ -522,18 +522,83 @@ async def handle_export_agent_config(request: web.Request) -> web.Response:
 # App factory
 # ──────────────────────────────────────────────────────────────
 
+async def handle_activate_follower(request: web.Request) -> web.Response:
+    """Activate a local follower — launch MT5 + start following."""
+    bridge = request.app.get("bridge")
+    if not bridge:
+        return web.json_response({"status": "error", "message": "Bridge not available"}, status=503)
+    name = request.match_info.get("name", "")
+    if not name:
+        return web.json_response({"status": "error", "message": "Missing follower name"}, status=400)
+
+    # Queue activation in the bridge thread (avoids blocking the event loop)
+    success, message = bridge.activate_follower(name)
+    if not success:
+        return web.json_response({"status": "error", "message": message})
+
+    # Poll for completion (bridge runs activation in its own thread)
+    deadline = time.time() + 90.0
+    while time.time() < deadline:
+        result = bridge.check_activation(name)
+        if result is not None:
+            ok, msg = result
+            return web.json_response({"status": "ok" if ok else "error", "message": msg})
+        await asyncio.sleep(1.0)
+
+    return web.json_response({"status": "timeout", "message": f"Activation of '{name}' timed out"})
+
+
+async def handle_deactivate_follower(request: web.Request) -> web.Response:
+    """Deactivate a local follower."""
+    bridge = request.app.get("bridge")
+    if not bridge:
+        return web.json_response({"status": "error", "message": "Bridge not available"}, status=503)
+    name = request.match_info.get("name", "")
+    if not name:
+        return web.json_response({"status": "error", "message": "Missing follower name"}, status=400)
+    success, message = bridge.deactivate_follower(name)
+    return web.json_response({"status": "ok" if success else "error", "message": message})
+
+
+async def handle_follower_status(request: web.Request) -> web.Response:
+    """Get status of all local followers (from config + activation state)."""
+    bridge = request.app.get("bridge")
+    state: SharedState = request.app["state"]
+    cfg: Config = request.app["config"]
+    active = bridge.get_active_followers() if bridge else {}
+    follower_states = state.follower_states_snapshot()
+    
+    results = []
+    for fc in cfg.followers:
+        info = {
+            "name": fc.name,
+            "server": fc.server,
+            "login": fc.login,
+            "active": fc.name in active,
+        }
+        # Merge runtime status
+        if fc.name in active:
+            info.update(active[fc.name])
+        if fc.name in follower_states:
+            info.update(follower_states[fc.name])
+        results.append(info)
+    
+    return web.json_response({"followers": results})
+
 def create_app(
     state: SharedState,
     event_queue: asyncio.Queue,
     cfg: Config,
     config_path: str = "config.yaml",
+    bridge: Any = None,
 ) -> web.Application:
     app = web.Application()
     app["state"] = state
     app["event_queue"] = event_queue
     app["config"] = cfg
     app["config_path"] = config_path
-    app['public_config_path'] = config_path
+    app["public_config_path"] = config_path
+    app["bridge"] = bridge
 
     hub = AgentHub(state, event_queue)
     app["hub"] = hub
@@ -570,6 +635,11 @@ def create_app(
     app.router.add_put("/api/config/followers/{name}", handle_update_follower)
     app.router.add_delete("/api/config/followers/{name}", handle_delete_follower)
     app.router.add_get("/api/config/export-agent", handle_export_agent_config)
+
+    # Follower activation
+    app.router.add_get("/api/followers/status", handle_follower_status)
+    app.router.add_post("/api/followers/{name}/activate", handle_activate_follower)
+    app.router.add_post("/api/followers/{name}/deactivate", handle_deactivate_follower)
 
     async def _record_equity(app):
         """Background task: record equity snapshots every 60s."""
