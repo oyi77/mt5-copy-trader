@@ -34,3 +34,13 @@ agent_config.yaml
 *.pid
 _out.txt
 *.png
+
+# Test artifacts
+mt5-portable-data/
+mt5_setup.exe
+mt5setup*.exe
+test_mt5_install.py
+
+# Full MT5 installations (copies)
+MT5 Follower Test/
+MT5 Follower */

@@ -610,8 +610,6 @@
         html += '<span>Login: '+(f.login||'\u2014')+'</span><span>Server: '+(f.server||'\u2014')+'</span>';
         html += '<span>Lot: '+(f.lot_multiplier||1)+'x</span><span>Port: '+(f.port||'\u2014')+'</span>';
         html += '<span>'+(f.has_password?'OK pw':'NO pw')+'</span>';
-        if (st.portable_path) html += '<span>Portable: '+escHtml(st.portable_path)+'</span>';
-        else if (f.portable_path) html += '<span>Portable: '+escHtml(f.portable_path)+'</span>';
         if (active) html += '<span>Events OK: '+evOk+'</span><span>Errors: '+errCount+'</span>';
         html += '</div></div>';
       }

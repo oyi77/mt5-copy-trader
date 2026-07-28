@@ -18,10 +18,9 @@ logger = logging.getLogger(__name__)
 class FollowerExecutor:
     """Connects to a follower MT5 terminal and executes trade events."""
 
-    def __init__(self, config: FollowerConfig, master_port: int = 0):
+    def __init__(self, config: FollowerConfig):
         self._cfg = config
         self._name = config.name
-        self._master_port = master_port
         self._process: Optional[subprocess.Popen] = None
         self._exe_path: str = config.path
 
@@ -34,33 +33,41 @@ class FollowerExecutor:
     # ------------------------------------------------------------------
 
     def launch_terminal(self, timeout: float = 15.0) -> bool:
-        """Ensure the MT5 terminal is running and accessible.
+        """Ensure the follower's MT5 terminal process is running.
 
-        On same-machine followers, this reuses the master's terminal process
-        (avoids needing a separate MT5 installation). The terminal is already
-        running since the bridge keeps the master connected.
-
-        The follower connects via mt5.initialize() with login/password/server,
-        which logs into the follower's account on the same terminal.
+        Each follower uses its OWN MT5 installation at self._cfg.path
+        with its own Manager API port. mt5.initialize() auto-starts the
+        terminal if it isn't running.
         """
-        import os
-
-        logger.info("%s: same-machine — reusing master terminal via account switching", self._name)
-        self._exe_path = self._cfg.path
-        logger.info("%s: terminal ready (shares master's MT5 installation)", self._name)
+        logger.info(
+            "%s: launching terminal at %s port %d...",
+            self._name, self._cfg.path, self._cfg.port,
+        )
+        result = mt5.initialize(
+            path=self._cfg.path,
+            port=self._cfg.port,
+            login=self._cfg.login,
+            password=self._cfg.password,
+            server=self._cfg.server,
+            timeout=int(timeout * 1000),
+        )
+        if not result:
+            logger.error("%s: launch_terminal failed: %s", self._name, mt5.last_error())
+            return False
+        logger.info("%s: terminal started and logged in", self._name)
+        mt5.shutdown()
         return True
 
     def connect(self, master_port: int = 0) -> bool:
-        """Initialize MT5 API connection to this follower's terminal.
+        """Initialize MT5 API connection to THIS follower's OWN terminal.
 
-        For same-machine followers, the master's terminal is reused and
-        account switching happens via mt5.initialize(login, password, server).
-        The master_port parameter should be set when the follower shares
-        the master's terminal.
+        Each follower runs its own MT5 installation at its own path and port.
+        The master_port parameter is ignored — the follower always uses
+        its own configured path + port for true isolation.
         """
-        port = master_port or self._master_port or self._cfg.port
+        port = self._cfg.port
         result = mt5.initialize(
-            path=self._exe_path,
+            path=self._cfg.path,
             port=port,
             login=self._cfg.login,
             password=self._cfg.password,
@@ -70,7 +77,7 @@ class FollowerExecutor:
         if not result:
             logger.error("%s: connect failed: %s", self._name, mt5.last_error())
         else:
-            logger.info("%s: connected successfully", self._name)
+            logger.info("%s: connected to own terminal (port %d)", self._name, port)
         return result
 
     def disconnect(self) -> None:

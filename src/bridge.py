@@ -145,7 +145,7 @@ class CopyTradeBridge:
             self._activation_results[name] = (False, f"Follower '{name}' not found")
             return
 
-        executor = FollowerExecutor(cfg, master_port=self._cfg.master.port)
+        executor = FollowerExecutor(cfg)
 
         # Launch MT5 terminal
         launched = executor.launch_terminal()
@@ -154,7 +154,7 @@ class CopyTradeBridge:
             return
 
         # Connect with login credentials
-        if not executor.connect(master_port=self._cfg.master.port):
+        if not executor.connect():
             self._activation_results[name] = (False, f"MT5 connect failed for '{name}'")
             return
 
@@ -171,7 +171,7 @@ class CopyTradeBridge:
                     name, acc.login, cfg.login,
                 )
                 mt5.shutdown()
-                if not executor.connect(master_port=self._cfg.master.port):
+                if not executor.connect():
                     self._activation_results[name] = (False, f"Failed to relogin for '{name}'")
                     return
                 acc = mt5.account_info()
