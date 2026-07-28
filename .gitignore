@@ -44,3 +44,4 @@ test_mt5_install.py
 # Full MT5 installations (copies)
 MT5 Follower Test/
 MT5 Follower */
+follower_terminals/
