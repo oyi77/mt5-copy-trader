@@ -82,7 +82,16 @@ class AgentHub:
                         continue
 
                     msg_type = data.get("type", "")
-                    if msg_type == "status":
+                    if msg_type == "register":
+                        self._state.update_agent_info(name, data)
+                        logger.info(
+                            "Agent '%s' registered: %s v%s on %s",
+                            name,
+                            data.get("agent_id", "?"),
+                            data.get("version", "?"),
+                            data.get("hostname", "?"),
+                        )
+                    elif msg_type == "status":
                         self._state.update_agent_status(name, data)
                     elif msg_type == "execution_result":
                         success = data.get("success", False)
@@ -99,6 +108,13 @@ class AgentHub:
                         if sent:
                             latency = round((time.time() - sent) * 1000, 1)
                             self._state.record_agent_latency(name, latency)
+                    elif msg_type == "config_ack":
+                        applied = data.get("applied", False)
+                        logger.info(
+                            "Agent %s: config %s",
+                            name,
+                            "applied" if applied else "no-op",
+                        )
 
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     logger.error("Agent %s WS error: %s", name, ws.exception())
@@ -146,6 +162,13 @@ class AgentHub:
             self._connections.pop(name, None)
             self._state.unregister_agent(name)
             return False
+
+    async def push_config(self, name: str, config: dict) -> bool:
+        """Push config overrides to a connected agent."""
+        return await self.send_to_agent(name, {
+            "type": "config_update",
+            "config": config,
+        })
 
     async def _broadcast_loop(self) -> None:
         while True:
@@ -228,6 +251,12 @@ def _get_agent_order(state: SharedState) -> list[dict]:
             "name": a["name"],
             "type": "agent",
             "connected": a["connected"],
+            # Identity
+            "agent_id": a.get("agent_id", ""),
+            "version": a.get("version", ""),
+            "hostname": a.get("hostname", ""),
+            "platform": a.get("platform", ""),
+            # Account
             "balance": a["balance"],
             "equity": a["equity"],
             "margin": a["margin"],
@@ -247,6 +276,7 @@ def _get_agent_order(state: SharedState) -> list[dict]:
             "events_copied": a["events_copied"],
             "errors": a["errors"],
             "ping_history": a.get("ping_history", []),
+            "config_overrides": a.get("config_overrides", {}),
         })
     return rows
 
@@ -364,6 +394,76 @@ async def handle_ping_agent(request: web.Request) -> web.Response:
     return web.json_response({
         "latency_ms": agent.latency_ms if agent else -1,
         "connected": agent.connected if agent else False,
+    })
+
+
+async def handle_get_agent_config(request: web.Request) -> web.Response:
+    """Get current config overrides for a specific agent."""
+    state: SharedState = request.app["state"]
+    name = request.match_info["name"]
+    agent = state.get_agent(name)
+    if not agent:
+        return web.json_response({"error": "not found"}, status=404)
+    return web.json_response({
+        "name": name,
+        "config_overrides": state.get_agent_config_override(name),
+    })
+
+
+async def handle_update_agent_config(request: web.Request) -> web.Response:
+    """Update config overrides for a specific agent (stored locally, not pushed).
+
+    To also push to the live agent, use POST /api/agents/{name}/push-config.
+    """
+    state: SharedState = request.app["state"]
+    name = request.match_info["name"]
+    agent = state.get_agent(name)
+    if not agent:
+        return web.json_response({"error": "not found"}, status=404)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    state.set_agent_config_override(name, data)
+    return web.json_response({"status": "ok", "config_overrides": state.get_agent_config_override(name)})
+
+
+async def handle_push_agent_config(request: web.Request) -> web.Response:
+    """Push current config overrides to a connected agent."""
+    state: SharedState = request.app["state"]
+    hub: AgentHub = request.app["hub"]
+    name = request.match_info["name"]
+
+    agent = state.get_agent(name)
+    if not agent:
+        return web.json_response({"error": "not found"}, status=404)
+
+    if not agent.connected:
+        return web.json_response({"error": "agent not connected"}, status=400)
+
+    # Allow request body to override specific fields
+    overrides = state.get_agent_config_override(name)
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            overrides.update(body)
+            state.set_agent_config_override(name, overrides)
+    except Exception:
+        pass  # no body or invalid JSON = use stored overrides
+
+    if not overrides:
+        return web.json_response({"status": "ok", "message": "no overrides to push"})
+
+    ok = await hub.push_config(name, overrides)
+    if not ok:
+        return web.json_response({"error": "send failed"}, status=502)
+
+    return web.json_response({
+        "status": "ok",
+        "message": f"Config pushed to '{name}'",
+        "config": overrides,
     })
 
 
@@ -618,6 +718,9 @@ def create_app(
     app.router.add_get("/api/agents", handle_list_agents)
     app.router.add_get("/api/agents/{name}", handle_get_agent)
     app.router.add_post("/api/agents/{name}/ping", handle_ping_agent)
+    app.router.add_get("/api/agents/{name}/config", handle_get_agent_config)
+    app.router.add_put("/api/agents/{name}/config", handle_update_agent_config)
+    app.router.add_post("/api/agents/{name}/push-config", handle_push_agent_config)
 
     # Activity + Equity
     app.router.add_get("/api/activity", handle_activity)

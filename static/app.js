@@ -225,9 +225,17 @@
     h += '<div class="agent-left">';
     h += '<span class="dot '+(acc.connected?'green':'red')+'"></span>';
     h += '<div><strong>'+escHtml(acc.name)+'</strong>';
-    h += '<span class="agent-sub">'+(isMaster?'MASTER':'FOLLOWER');
+    h += '<span class="agent-sub">'+(isMaster?'MASTER':'AGENT');
     if (acc.server) h += ' &middot; '+escHtml(acc.server);
-    h += ' &middot; '+(acc.account_login||'')+'</span></div></div>';
+    h += ' &middot; '+(acc.account_login||'');
+    // Agent identity info
+    if (!isMaster && acc.hostname) {
+      h += ' &middot; '+escHtml(acc.hostname);
+    }
+    if (!isMaster && acc.version) {
+      h += ' &middot; v'+escHtml(acc.version);
+    }
+    h += '</span></div></div>';
     h += '<div class="agent-metrics">';
     h += '<div class="metric"><div class="mv">'+sym+fmt(acc.balance)+'</div><div class="ml">Balance</div></div>';
     h += '<div class="metric"><div class="mv">'+sym+fmt(acc.equity)+'</div><div class="ml">Equity</div></div>';
@@ -239,6 +247,9 @@
       h += '<div class="metric"><div class="mv latency-'+latCls+'">'+(acc.latency_ms||'\u2014')+'ms</div>'+
            '<div class="ml">Latency</div></div>';
       h += '<div class="metric"><button class="btn btn-sm" data-toggle="ping">Ping</button></div>';
+      if (acc.config_overrides && Object.keys(acc.config_overrides).length > 0) {
+        h += '<div class="metric"><div class="mv" style="font-size:11px;color:var(--accent)">config</div><div class="ml">'+Object.keys(acc.config_overrides).join(', ')+'</div></div>';
+      }
     }
     h += '</div></div>';
     if (posHtml) {
@@ -369,7 +380,8 @@
       var c = grid.children[i];
       var name = c.getAttribute('data-acc');
       if (name) {
-        var panel = c.querySelector('.positions-panel');
+        var panel = c.querySelector('.config-panel');
+        var toggle = c.querySelector('[data-toggle="config"]');
         if (panel && panel.classList.contains("open")) {
           expanded[name] = true;
         }
@@ -378,7 +390,12 @@
 
     var html = '';
     for (var i = 0; i < accounts.length; i++) {
-      html += buildAccountCard(accounts[i], accounts[i].type === 'master');
+      var acc = accounts[i];
+      html += buildAccountCard(acc, acc.type === 'master');
+      // Add config panel for agents
+      if (acc.type === 'agent') {
+        html += buildAgentConfig(acc);
+      }
     }
     grid.innerHTML = html;
     $('agent-count').textContent = '(' + accounts.length + ' total)';
@@ -388,15 +405,100 @@
       var c = grid.children[i];
       var name = c.getAttribute('data-acc');
       if (name && expanded[name]) {
-        var panel = c.querySelector('.positions-panel');
-        var toggle = c.querySelector('[data-toggle="positions"]');
-        if (panel && toggle) {
-          panel.classList.add("open");
-          var icon = toggle.querySelector('.expand-icon');
-          if (icon) icon.textContent = '\u25BE';
-        }
+        var panel = c.querySelector('.config-panel');
+        if (panel) panel.classList.add("open");
       }
     }
+    // Re-bind ping buttons
+    qa('[data-toggle="ping"]').forEach(function(b) {
+      b.onclick = function(e) {
+        e.stopPropagation();
+        var card = b.closest('[data-acc]');
+        if (card) pingAgent(card.getAttribute('data-acc'));
+      };
+    });
+    // Re-bind config toggle buttons
+    qa('[data-toggle="config"]').forEach(function(b) {
+      b.onclick = function(e) {
+        e.stopPropagation();
+        var card = b.closest('[data-acc]');
+        if (card) {
+          var panel = card.nextElementSibling;
+          if (panel && panel.classList.contains('config-panel')) {
+            panel.classList.toggle('open');
+          }
+        }
+      };
+    });
+  }
+
+  function buildAgentConfig(acc) {
+    var overrides = acc.config_overrides || {};
+    var name = acc.name.replace(/"/g,'&quot;');
+    var safeId = acc.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    var h = '<div class="config-panel" id="cfg-'+safeId+'" data-acc="'+name+'">';
+    h += '<div class="config-header"><button class="btn btn-sm" data-toggle="config">Config</button>';
+    h += '<span style="color:var(--text-dim);font-size:12px">remote agent settings</span></div>';
+    h += '<div class="config-fields">';
+    // Lot multiplier
+    h += '<div class="cfg-row"><label>Lot Multiplier</label>';
+    h += '<input type="number" step="0.01" min="0.01" max="10" class="cfg-input" id="cfg-'+safeId+'-mult" value="'+(overrides.lot_multiplier||1.0)+'"></div>';
+    // Max lot
+    h += '<div class="cfg-row"><label>Max Lot</label>';
+    h += '<input type="number" step="0.01" min="0.01" class="cfg-input" id="cfg-'+safeId+'-maxlot" value="'+(overrides.max_lot||10.0)+'"></div>';
+    // Deviation
+    h += '<div class="cfg-row"><label>Deviation (pts)</label>';
+    h += '<input type="number" step="1" min="0" class="cfg-input" id="cfg-'+safeId+'-dev" value="'+(overrides.deviation||20)+'"></div>';
+    // Max positions
+    h += '<div class="cfg-row"><label>Max Positions</label>';
+    h += '<input type="number" step="1" min="1" class="cfg-input" id="cfg-'+safeId+'-maxpos" value="'+(overrides.max_positions||20)+'"></div>';
+    // Magic number
+    h += '<div class="cfg-row"><label>Magic #</label>';
+    h += '<input type="number" step="1" class="cfg-input" id="cfg-'+safeId+'-magic" value="'+(overrides.magic||951001)+'"></div>';
+    h += '</div>';
+    h += '<div class="config-actions">';
+    h += '<button class="btn btn-primary btn-sm" onclick="saveAgentConfig(\''+escHtml(acc.name)+'\')">Save Config</button>';
+    h += '<button class="btn btn-sm" onclick="pushAgentConfig(\''+escHtml(acc.name)+'\')" style="border-color:var(--accent);color:var(--accent)">Push to Agent</button>';
+    h += '</div></div>';
+    return h;
+  }
+
+  async function saveAgentConfig(name) {
+    var safeId = name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    var config = {
+      lot_multiplier: parseFloat($('cfg-'+safeId+'-mult').value || 1.0),
+      max_lot: parseFloat($('cfg-'+safeId+'-maxlot').value || 10.0),
+      deviation: parseInt($('cfg-'+safeId+'-dev').value || 20),
+      max_positions: parseInt($('cfg-'+safeId+'-maxpos').value || 20),
+      magic: parseInt($('cfg-'+safeId+'-magic').value || 951001),
+    };
+    try {
+      var r = await(await fetch('/api/agents/'+encodeURIComponent(name)+'/config',{
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(config),
+      })).json();
+      toast('Config saved for '+name);
+    } catch(e) { toast('Save failed: '+e,'error'); }
+  }
+
+  async function pushAgentConfig(name) {
+    var safeId = name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    var config = {
+      lot_multiplier: parseFloat($('cfg-'+safeId+'-mult').value || 1.0),
+      max_lot: parseFloat($('cfg-'+safeId+'-maxlot').value || 10.0),
+      deviation: parseInt($('cfg-'+safeId+'-dev').value || 20),
+      max_positions: parseInt($('cfg-'+safeId+'-maxpos').value || 20),
+      magic: parseInt($('cfg-'+safeId+'-magic').value || 951001),
+    };
+    try {
+      var r = await(await fetch('/api/agents/'+encodeURIComponent(name)+'/push-config',{
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(config),
+      })).json();
+      toast('Config pushed to '+name);
+    } catch(e) { toast('Push failed: '+e,'error'); }
   }
 
   async function pingAgent(name) {

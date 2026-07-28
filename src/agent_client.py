@@ -1,10 +1,16 @@
-"""Agent WebSocket client — runs on each follower machine."""
+"""Agent WebSocket client — runs on each follower machine as a daemon.
+
+Connects to the hub, registers itself with identity info, receives trade
+events and config updates, executes on local MT5. Auto-reconnects on
+disconnect with exponential backoff.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import platform
 import random
 import time
 import urllib.parse
@@ -17,6 +23,8 @@ from src.config import FollowerConfig
 
 logger = logging.getLogger(__name__)
 
+AGENT_VERSION = "1.0.0"
+
 
 class AgentClient:
     """Connects to the hub, receives trade events, executes on local MT5."""
@@ -26,15 +34,19 @@ class AgentClient:
         hub_url: str,
         follower_cfg: FollowerConfig,
         agent_name: str,
+        agent_id: str = "",
     ):
         self._hub_url = hub_url.rstrip("/")
         self._follower_cfg = follower_cfg
         self._agent_name = agent_name
+        self._agent_id = agent_id or agent_name
         self._executor = FollowerExecutor(follower_cfg)
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._running = False
         self._last_status_send = 0.0
+        self._hostname = platform.node()
+        self._platform = f"{platform.system()} {platform.release()}"
 
     # ------------------------------------------------------------------
     # Public API
@@ -48,6 +60,7 @@ class AgentClient:
         while self._running:
             try:
                 await self._connect_and_listen()
+                retry_delay = 1.0  # reset on successful cycle
             except asyncio.CancelledError:
                 break
             except aiohttp.ClientConnectorDNSError:
@@ -103,6 +116,9 @@ class AgentClient:
             self._ws = ws
             logger.info("Connected to hub as '%s'", self._agent_name)
 
+            # Send registration on connect
+            await self._send_registration()
+
             # Send initial status immediately
             await self._send_status()
 
@@ -114,6 +130,22 @@ class AgentClient:
                     break
                 elif msg.type == aiohttp.WSMsgType.CLOSED:
                     break
+
+    async def _send_registration(self) -> None:
+        """Send agent identity to hub so it knows who we are."""
+        reg = {
+            "type": "register",
+            "agent_id": self._agent_id,
+            "name": self._agent_name,
+            "version": AGENT_VERSION,
+            "hostname": self._hostname,
+            "platform": self._platform,
+        }
+        try:
+            await self._ws.send_str(json.dumps(reg))
+            logger.info("Registered with hub: %s v%s on %s", self._agent_name, AGENT_VERSION, self._hostname)
+        except Exception:
+            logger.exception("Failed to send registration")
 
     async def _handle_message(self, raw: str) -> None:
         try:
@@ -138,10 +170,68 @@ class AgentClient:
             except Exception:
                 pass
 
+        elif msg_type == "config_update":
+            await self._handle_config_update(data.get("config", {}))
+
         # Send status periodically (every 5s) or when positions likely changed
         now = time.time()
         if now - self._last_status_send > 5.0:
             await self._send_status()
+
+    async def _handle_config_update(self, config: dict) -> None:
+        """Apply config overrides pushed from the hub/dashboard."""
+        if not config:
+            return
+
+        changed = []
+        cfg = self._follower_cfg
+
+        if "lot_multiplier" in config:
+            old = cfg.lot_multiplier
+            cfg.lot_multiplier = float(config["lot_multiplier"])
+            changed.append(f"lot_multiplier: {old} → {cfg.lot_multiplier}")
+
+        if "max_lot" in config:
+            cfg.max_lot = float(config["max_lot"])
+            changed.append(f"max_lot: {cfg.max_lot}")
+
+        if "min_lot" in config:
+            cfg.min_lot = float(config["min_lot"])
+            changed.append(f"min_lot: {cfg.min_lot}")
+
+        if "max_positions" in config:
+            cfg.max_positions = int(config["max_positions"])
+            changed.append(f"max_positions: {cfg.max_positions}")
+
+        if "deviation" in config:
+            cfg.deviation = int(config["deviation"])
+            changed.append(f"deviation: {cfg.deviation}")
+
+        if "magic" in config:
+            cfg.magic = int(config["magic"])
+            changed.append(f"magic: {cfg.magic}")
+
+        if "symbol_mapping" in config and isinstance(config["symbol_mapping"], dict):
+            cfg.symbol_mapping = {k.upper(): v for k, v in config["symbol_mapping"].items()}
+            changed.append(f"symbol_mapping: {len(cfg.symbol_mapping)} entries")
+
+        if changed:
+            logger.info("Config updated from hub: %s", "; ".join(changed))
+        else:
+            logger.info("Config update received (no applicable fields)")
+
+        # Reconnect executor with new config
+        self._executor = FollowerExecutor(self._follower_cfg)
+
+        # Report back
+        try:
+            await self._ws.send_str(json.dumps({
+                "type": "config_ack",
+                "applied": bool(changed),
+                "config": config,
+            }))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Trade execution
@@ -215,6 +305,10 @@ class AgentClient:
             status = {
                 "type": "status",
                 "connected": False,
+                "agent_id": self._agent_id,
+                "version": AGENT_VERSION,
+                "hostname": self._hostname,
+                "platform": self._platform,
                 "balance": 0, "equity": 0, "margin": 0, "margin_free": 0,
                 "margin_level": 0, "leverage": 0,
                 "currency": "", "server": "", "account_name": "", "account_login": 0,
@@ -254,6 +348,10 @@ class AgentClient:
                 status = {
                     "type": "status",
                     "connected": True,
+                    "agent_id": self._agent_id,
+                    "version": AGENT_VERSION,
+                    "hostname": self._hostname,
+                    "platform": self._platform,
                     "balance": account.balance if account else 0,
                     "equity": equity,
                     "margin": margin,
@@ -272,7 +370,14 @@ class AgentClient:
                 }
             except Exception:
                 logger.exception("Failed to get MT5 status")
-                status = {"type": "status", "connected": False, "positions": [], "position_count": 0}
+                status = {
+                    "type": "status", "connected": False,
+                    "agent_id": self._agent_id,
+                    "version": AGENT_VERSION,
+                    "hostname": self._hostname,
+                    "platform": self._platform,
+                    "positions": [], "position_count": 0,
+                }
             finally:
                 self._executor.disconnect()
 

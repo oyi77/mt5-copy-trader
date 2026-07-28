@@ -57,6 +57,12 @@ class AgentInfo:
     connected_at: float = 0.0
     last_seen: float = 0.0
 
+    # Identity (set during registration)
+    agent_id: str = ""           # unique persistent agent identifier
+    version: str = ""            # software version
+    hostname: str = ""           # machine hostname
+    platform: str = ""           # OS platform
+
     # Account
     balance: float = 0.0
     equity: float = 0.0
@@ -85,6 +91,9 @@ class AgentInfo:
     errors: int = 0
     ping_history: list[float] = field(default_factory=list)
 
+    # Remote config overrides (pushed from dashboard)
+    config_overrides: dict = field(default_factory=dict)
+
     @property
     def total_floating_pnl(self) -> float:
         return sum(p.get("profit", 0) + p.get("swap", 0) for p in self.positions)
@@ -96,6 +105,10 @@ class AgentInfo:
             "ip": self.ip,
             "connected_at": self.connected_at,
             "last_seen": self.last_seen,
+            "agent_id": self.agent_id,
+            "version": self.version,
+            "hostname": self.hostname,
+            "platform": self.platform,
             "balance": self.balance,
             "equity": self.equity,
             "margin": self.margin,
@@ -115,6 +128,7 @@ class AgentInfo:
             "last_event_time": self.last_event_time,
             "events_copied": self.events_copied,
             "errors": self.errors,
+            "config_overrides": dict(self.config_overrides),
         }
 
 
@@ -213,12 +227,40 @@ class SharedState:
             info.last_seen = time.time()
             return info
 
+    def update_agent_info(self, name: str, data: dict) -> None:
+        """Update identity/info fields from registration message."""
+        with self._lock:
+            info = self.agents.get(name)
+            if not info:
+                return
+            info.agent_id = data.get("agent_id", info.agent_id)
+            info.version = data.get("version", info.version)
+            info.hostname = data.get("hostname", info.hostname)
+            info.platform = data.get("platform", info.platform)
+            config = data.get("config_overrides")
+            if config and isinstance(config, dict):
+                info.config_overrides.update(config)
+
     def unregister_agent(self, name: str) -> None:
         with self._lock:
             info = self.agents.get(name)
             if info:
                 info.connected = False
                 info.ip = ""
+
+    def get_agent_config_override(self, name: str) -> dict:
+        with self._lock:
+            info = self.agents.get(name)
+            if not info:
+                return {}
+            return dict(info.config_overrides)
+
+    def set_agent_config_override(self, name: str, config: dict) -> None:
+        with self._lock:
+            info = self.agents.get(name)
+            if not info:
+                return
+            info.config_overrides.update(config)
 
     def update_agent_status(self, name: str, data: dict) -> None:
         with self._lock:
@@ -241,6 +283,11 @@ class SharedState:
             info.total_pnl = data.get("total_pnl", info.total_pnl)
             info.positions = data.get("positions", info.positions)
             info.position_count = data.get("position_count", len(info.positions))
+            # Also update identity fields if present
+            for f in ("agent_id", "version", "hostname", "platform"):
+                val = data.get(f)
+                if val:
+                    setattr(info, f, val)
 
     def record_agent_event(self, name: str, success: bool) -> None:
         with self._lock:
