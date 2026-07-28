@@ -312,7 +312,7 @@ def load_agent_config(path: str) -> AgentConfig:
 
     cfg = AgentConfig(
         name=raw.get("name", "agent"),
-        hub_url=raw.get("hub_url", "http://localhost:5000"),
+        hub_url=raw.get("hub_url", "http://100.97.241.92:5000"),
         mt5_path=raw.get("mt5_path", "C:/Program Files/MetaTrader 5/terminal64.exe"),
         mt5_port=int(raw.get("mt5_port", 15555)),
         mt5_login=int(raw.get("mt5_login", 0)),
