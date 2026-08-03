@@ -267,6 +267,16 @@ class FileRelayCommandTest(unittest.TestCase):
             "DELETE_ORDER|50",
         )
 
+    def test_close_command_format(self):
+        # TradeReceiver.mq5 parses CLOSE's ticket from p[1] (`CLOSE|<ticket>`),
+        # unlike market orders where the ticket sits in p[5]. Sending the
+        # 6-field market layout would make the EA read the symbol as the ticket
+        # and never close the real position.
+        self.assertEqual(
+            self.ex._file_build_command("CLOSE", self._event("close")),
+            "CLOSE|50",
+        )
+
     # ── Execution + result handling ──────────────────────────────────
 
     def test_place_executes_to_done(self):

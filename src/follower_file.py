@@ -50,6 +50,14 @@ class FileRelayMixin:
             return f"{action}|{symbol}|{otype}|{volume:.2f}|{price}|{sl_str}|{tp_str}|{exp}|{ticket}"
         if action == "DELETE_ORDER":
             return f"{action}|{ticket}"
+        if action == "CLOSE":
+            # TradeReceiver.mq5 parses CLOSE as `CLOSE|<ticket>` — the ticket is
+            # p[1], unlike market orders where it sits in p[5]. Sending the
+            # 6-field market layout here makes the EA read p[1] (the symbol) as
+            # the ticket, find no "copied_<symbol>" comment, and return
+            # FAILED|NF_COMMENT — which the relay treats as a benign no-op while
+            # the real position stays open. Emit the 2-field form the EA expects.
+            return f"{action}|{ticket}"
         sl_str = f"{event.sl:.5f}" if event.sl else ""
         tp_str = f"{event.tp:.5f}" if event.tp else ""
         return f"{action}|{symbol}|{volume:.2f}|{sl_str}|{tp_str}|{ticket}"
