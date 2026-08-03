@@ -27,6 +27,10 @@ Thumbs.db
 # Config with secrets
 config.yaml
 agent_config.yaml
+agent_config_*.yaml
+agent_real_config*.yaml
+remote_*config*.yaml
+test_*config*.yaml
 !config.yaml.example
 !agent_config.yaml.example
 
@@ -45,3 +49,17 @@ test_mt5_install.py
 MT5 Follower Test/
 MT5 Follower */
 follower_terminals/
+mt5_exness/
+
+# Scratch / repo hygiene
+scratch/
+_repro/
+event_store.db*
+*.key
+*.b64
+%USERPROFILE%.sshknown_hosts
+temp_hex.txt
+mt5_portable.zip
+exness_servers.dat
+exness_settings.ini
+trade_events.json

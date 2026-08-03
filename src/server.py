@@ -45,12 +45,14 @@ if not os.path.isdir(STATIC):
 class AgentHub:
     """Manages WebSocket connections from remote follower agents."""
 
-    def __init__(self, state: SharedState, event_queue: asyncio.Queue):
+    def __init__(self, state: SharedState, event_queue: asyncio.Queue, event_store=None):
         self._state = state
         self._event_queue = event_queue
+        self._event_store = event_store
         self._connections: dict[str, web.WebSocketResponse] = {}
         self._broadcast_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
+        self._clock_skew_logged = False
 
     def start(self) -> None:
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
@@ -68,6 +70,15 @@ class AgentHub:
 
         name = request.query.get("name", f"agent-{id(ws):x}")
         ip = request.remote or "unknown"
+        old_ws = self._connections.get(name)
+        if old_ws is not None and old_ws is not ws and not old_ws.closed:
+            # Duplicate-name takeover: close the stale connection before storing
+            # the new one so its finally() can't pop/unregister the new live one.
+            logger.warning("Agent '%s' reconnected; closing previous connection", name)
+            try:
+                await old_ws.close()
+            except Exception:
+                logger.exception("Agent '%s': error closing superseded connection", name)
         self._connections[name] = ws
         self._state.register_agent(name, ip)
         logger.info("Agent connected: %s from %s", name, ip)
@@ -84,13 +95,34 @@ class AgentHub:
                     msg_type = data.get("type", "")
                     if msg_type == "register":
                         self._state.update_agent_info(name, data)
+                        # Track agent lifecycle state (unconfigured → deploying → trading)
+                        reg_status = data.get("status", "")
+                        if reg_status:
+                            self._state.update_agent_status(name, {"state": reg_status})
                         logger.info(
-                            "Agent '%s' registered: %s v%s on %s",
+                            "Agent '%s' registered: %s v%s on %s (status=%s)",
                             name,
                             data.get("agent_id", "?"),
                             data.get("version", "?"),
                             data.get("hostname", "?"),
+                            reg_status or "trading",
                         )
+                        # Backlog replay for missed events
+                        last_seq_id = data.get("last_seq_id", 0)
+                        if last_seq_id > 0 and self._event_store:
+                            missed = self._event_store.get_events_since(last_seq_id)
+                            if missed:
+                                logger.info("Replaying %d missed events to agent '%s'", len(missed), name)
+                                for idx, event_dict in enumerate(missed, start=1):
+                                    event_dict["_replay"] = True
+                                    try:
+                                        await ws.send_str(json.dumps({"type": "trade", "event": event_dict}))
+                                    except Exception as e:
+                                        logger.warning(
+                                            "Replay to agent '%s' failed after %d/%d events: %s",
+                                            name, idx - 1, len(missed), e,
+                                        )
+                                        break
                     elif msg_type == "status":
                         self._state.update_agent_status(name, data)
                     elif msg_type == "execution_result":
@@ -106,8 +138,26 @@ class AgentHub:
                     elif msg_type == "pong":
                         sent = data.get("timestamp", 0)
                         if sent:
-                            latency = round((time.time() - sent) * 1000, 1)
-                            self._state.record_agent_latency(name, latency)
+                            raw_ms = (time.time() - sent) * 1000
+                            if raw_ms < 0:
+                                if not self._clock_skew_logged:
+                                    self._clock_skew_logged = True
+                                    logger.warning(
+                                        "Agent '%s' pong timestamp %.3f is ahead of local clock "
+                                        "(skew %.1f ms): clock skew detected; latency clamped to 0",
+                                        name, sent, -raw_ms,
+                                    )
+                                raw_ms = 0.0
+                            self._state.record_agent_latency(name, round(raw_ms, 1))
+                    elif msg_type == "status_update":
+                        # Agent lifecycle state update (deploying → trading → error)
+                        agent_state = data.get("status", "")
+                        if agent_state:
+                            self._state.update_agent_status(name, {"state": agent_state})
+                            logger.info(
+                                "Agent '%s' status: %s %s",
+                                name, agent_state, data.get("message", "")
+                            )
                     elif msg_type == "config_ack":
                         applied = data.get("applied", False)
                         logger.info(
@@ -124,8 +174,11 @@ class AgentHub:
         except Exception:
             logger.exception("Agent %s: unexpected error", name)
         finally:
-            self._connections.pop(name, None)
-            self._state.unregister_agent(name)
+            # Only clean up if this connection is still the registered one —
+            # a newer connection may have taken over this name.
+            if self._connections.get(name) is ws:
+                self._connections.pop(name, None)
+                self._state.unregister_agent(name)
             logger.info("Agent disconnected: %s", name)
 
         return ws
@@ -170,6 +223,18 @@ class AgentHub:
             "config": config,
         })
 
+    async def push_deploy_config(self, name: str, config: dict) -> bool:
+        """Push full deploy config to an agent via WebSocket."""
+        ws = await self.get_agent_ws(name)
+        if not ws:
+            return False
+        try:
+            payload = json.dumps({"type": "config_deploy", "config": config})
+            await ws.send_str(payload)
+            return True
+        except Exception:
+            return False
+
     async def _broadcast_loop(self) -> None:
         while True:
             try:
@@ -180,12 +245,12 @@ class AgentHub:
                 for event in events:
                     payload = json.dumps({"type": "trade", "event": event})
                     agents = self.agents_to_broadcast()
-                    for name, ws in agents:
-                        try:
-                            await ws.send_str(payload)
-                        except (ConnectionError, asyncio.TimeoutError):
-                            self._connections.pop(name, None)
-                            self._state.unregister_agent(name)
+                    if agents:
+                        # Send to all agents concurrently so a slow agent can't
+                        # stall the rest; each agent still gets events in order.
+                        await asyncio.gather(
+                            *(self._send_broadcast(payload, name, ws) for name, ws in agents)
+                        )
 
             except asyncio.CancelledError:
                 break
@@ -193,24 +258,45 @@ class AgentHub:
                 logger.exception("Broadcast loop error")
                 await asyncio.sleep(1)
 
+    async def _send_broadcast(self, payload: str, name: str, ws: web.WebSocketResponse) -> None:
+        try:
+            await ws.send_str(payload)
+        except (ConnectionError, asyncio.TimeoutError):
+            self._connections.pop(name, None)
+            self._state.unregister_agent(name)
+            logger.warning("Broadcast to agent '%s' failed; removed from hub", name)
+        except Exception:
+            logger.exception("Agent '%s': broadcast send error", name)
+
     async def _ping_loop(self) -> None:
         while True:
-            await asyncio.sleep(10)
-            now = time.time()
-            agents = self.agents_to_broadcast()
-            for name, ws in agents:
-                try:
-                    await ws.send_str(json.dumps({"type": "ping", "timestamp": now}))
-                except (ConnectionError, asyncio.TimeoutError):
-                    pass
+            try:
+                await asyncio.sleep(10)
+                now = time.time()
+                agents = self.agents_to_broadcast()
+                for name, ws in agents:
+                    try:
+                        await ws.send_str(json.dumps({"type": "ping", "timestamp": now}))
+                    except (ConnectionError, asyncio.TimeoutError):
+                        self._connections.pop(name, None)
+                        self._state.unregister_agent(name)
+                        logger.warning("Ping to agent '%s' failed; removed from hub", name)
+                    except Exception:
+                        logger.exception("Agent '%s': ping error", name)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Ping loop error")
+                await asyncio.sleep(1)
 
 
 # ──────────────────────────────────────────────────────────────
 # Dashboard REST + SSE
 # ──────────────────────────────────────────────────────────────
 
-def _get_agent_order(state: SharedState) -> list[dict]:
-    snapshot = state.snapshot()
+def _get_agent_order(state: SharedState, snapshot: Optional[dict] = None) -> list[dict]:
+    if snapshot is None:
+        snapshot = state.snapshot()
     rows = []
 
     # Master
@@ -277,14 +363,15 @@ def _get_agent_order(state: SharedState) -> list[dict]:
             "errors": a["errors"],
             "ping_history": a.get("ping_history", []),
             "config_overrides": a.get("config_overrides", {}),
+            "state": a.get("state", "unknown"),
         })
     return rows
 
 
 async def handle_api_status(request: web.Request) -> web.Response:
     state: SharedState = request.app["state"]
-    rows = _get_agent_order(state)
     snap = state.snapshot()
+    rows = _get_agent_order(state, snap)
     return web.json_response({
         "accounts": rows,
         "portfolio": snap["portfolio"],
@@ -299,17 +386,20 @@ async def handle_api_stream(request: web.Request) -> web.StreamResponse:
         status=200, reason="OK",
         headers={
             "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
+            # Dashboard is same-origin; a wildcard ACAO would expose live
+            # trading data to any website, so no Access-Control-Allow-Origin.
+            "Cache-Control": "no-store",
             "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
             "X-Accel-Buffering": "no",
         },
     )
     await response.prepare(request)
     try:
+        # SSE retry hint (comment-style line): reconnect after 3 seconds.
+        await response.write(b"retry: 3000\n\n")
         while True:
-            rows = _get_agent_order(state)
             snap = state.snapshot()
+            rows = _get_agent_order(state, snap)
             payload = json.dumps({
                 "accounts": rows,
                 "portfolio": snap["portfolio"],
@@ -325,7 +415,6 @@ async def handle_api_stream(request: web.Request) -> web.StreamResponse:
 
 async def handle_favicon(request: web.Request) -> web.Response:
     """Serve an inline SVG favicon."""
-    import io
     svg = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="%236366f1"/><text x="32" y="44" text-anchor="middle" fill="white" font-size="36" font-weight="bold" font-family="sans-serif">C</text></svg>'
     return web.Response(
         body=svg,
@@ -347,7 +436,7 @@ async def handle_api_portfolio(request: web.Request) -> web.Response:
     snap = state.snapshot()
     return web.json_response({
         "portfolio": snap["portfolio"],
-        "accounts": _get_agent_order(state),
+        "accounts": _get_agent_order(state, snap),
         "t": time.time(),
     })
 
@@ -436,11 +525,9 @@ async def handle_push_agent_config(request: web.Request) -> web.Response:
     hub: AgentHub = request.app["hub"]
     name = request.match_info["name"]
 
-    agent = state.get_agent(name)
-    if not agent:
-        return web.json_response({"error": "not found"}, status=404)
-
-    if not agent.connected:
+    # Check hub's active connections instead of state (avoids race on reconnect)
+    ws = await hub.get_agent_ws(name)
+    if not ws:
         return web.json_response({"error": "agent not connected"}, status=400)
 
     # Allow request body to override specific fields
@@ -467,13 +554,58 @@ async def handle_push_agent_config(request: web.Request) -> web.Response:
     })
 
 
+async def handle_deploy_agent(request: web.Request) -> web.Response:
+    """Deploy full config to an unconfigured agent."""
+    state: SharedState = request.app["state"]
+    hub: AgentHub = request.app["hub"]
+    name = request.match_info["name"]
+
+    agent = state.get_agent(name)
+    if not agent:
+        return web.json_response({"error": "agent not found"}, status=404)
+
+    try:
+        config = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    if not isinstance(config, dict) or not config.get("name") \
+            or not (config.get("hub_url") or config.get("mt5_login")):
+        return web.json_response({
+            "error": "invalid config: expected an object with 'name' and 'hub_url' or 'mt5_login'",
+        }, status=400)
+
+    ok = await hub.push_deploy_config(name, config)
+    if not ok:
+        return web.json_response({"error": "agent not connected or send failed"}, status=502)
+
+    state.record_activity("system", f"Deploying config to agent '{name}'")
+    return web.json_response({"status": "ok", "message": f"Deploying config to {name}"})
+
+
 # ──────────────────────────────────────────────────────────────
 # Activity + Equity History API
 # ──────────────────────────────────────────────────────────────
 
+def _parse_limit(request: web.Request, default: int) -> Optional[int]:
+    """Parse the ?limit= query param: int >= 0, capped at 1000. None if invalid."""
+    raw = request.query.get("limit")
+    if raw is None:
+        return default
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if limit < 0:
+        return None
+    return min(limit, 1000)
+
+
 async def handle_activity(request: web.Request) -> web.Response:
     state: SharedState = request.app["state"]
-    limit = int(request.query.get("limit", 100))
+    limit = _parse_limit(request, 100)
+    if limit is None:
+        return web.json_response({"error": "invalid limit"}, status=400)
     type_filter = request.query.get("type", None)
     return web.json_response({
         "events": state.get_activity(limit, type_filter),
@@ -483,7 +615,9 @@ async def handle_activity(request: web.Request) -> web.Response:
 
 async def handle_equity_history(request: web.Request) -> web.Response:
     state: SharedState = request.app["state"]
-    limit = int(request.query.get("limit", 200))
+    limit = _parse_limit(request, 200)
+    if limit is None:
+        return web.json_response({"error": "invalid limit"}, status=400)
     return web.json_response({
         "points": state.equity_history.get(limit),
         "t": time.time(),
@@ -555,28 +689,46 @@ async def handle_get_config(request: web.Request) -> web.Response:
 
 async def handle_update_master(request: web.Request) -> web.Response:
     cfg: Config = request.app["config"]
-    data = await request.json()
-    cfg.update_master(data)
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    try:
+        cfg.update_master(data)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
     save_config(cfg, request.app["config_path"])
     return web.json_response({"status": "ok"})
 
 
 async def handle_update_server(request: web.Request) -> web.Response:
     cfg: Config = request.app["config"]
-    data = await request.json()
-    cfg.update_server(data)
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    try:
+        cfg.update_server(data)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
     save_config(cfg, request.app["config_path"])
     return web.json_response({"status": "ok"})
 
 
 async def handle_add_follower(request: web.Request) -> web.Response:
     cfg: Config = request.app["config"]
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
     if not data.get("name"):
         return web.json_response({"status": "error", "message": "name required"}, status=400)
     if any(f.name == data["name"] for f in cfg.followers):
         return web.json_response({"status": "error", "message": "name already exists"}, status=409)
-    f = cfg.add_follower(data)
+    try:
+        f = cfg.add_follower(data)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
     save_config(cfg, request.app["config_path"])
     return web.json_response({"status": "ok", "follower": follower_to_safe_dict(f)})
 
@@ -584,8 +736,14 @@ async def handle_add_follower(request: web.Request) -> web.Response:
 async def handle_update_follower(request: web.Request) -> web.Response:
     cfg: Config = request.app["config"]
     name = request.match_info["name"]
-    data = await request.json()
-    f = cfg.update_follower(name, data)
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    try:
+        f = cfg.update_follower(name, data)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
     if not f:
         return web.json_response({"status": "error", "message": "not found"}, status=404)
     save_config(cfg, request.app["config_path"])
@@ -691,6 +849,7 @@ def create_app(
     cfg: Config,
     config_path: str = "config.yaml",
     bridge: Any = None,
+    event_store=None,
 ) -> web.Application:
     app = web.Application()
     app["state"] = state
@@ -700,7 +859,7 @@ def create_app(
     app["public_config_path"] = config_path
     app["bridge"] = bridge
 
-    hub = AgentHub(state, event_queue)
+    hub = AgentHub(state, event_queue, event_store=event_store)
     app["hub"] = hub
 
     # Dashboard
@@ -721,6 +880,7 @@ def create_app(
     app.router.add_get("/api/agents/{name}/config", handle_get_agent_config)
     app.router.add_put("/api/agents/{name}/config", handle_update_agent_config)
     app.router.add_post("/api/agents/{name}/push-config", handle_push_agent_config)
+    app.router.add_post("/api/agents/{name}/deploy", handle_deploy_agent)
 
     # Activity + Equity
     app.router.add_get("/api/activity", handle_activity)
@@ -759,7 +919,7 @@ def create_app(
             except asyncio.CancelledError:
                 break
             except Exception:
-                pass
+                logger.exception("Equity history recording failed")
 
     async def _on_startup(app):
         hub.start()

@@ -33,7 +33,7 @@ from aiohttp import web
 from src.bridge import CopyTradeBridge
 from src.config import load_config, save_config
 from src.server import create_app
-from src.state import SharedState
+from src.state import SharedState, EventStore
 
 
 def _bundle_path() -> str:
@@ -98,10 +98,18 @@ def main() -> None:
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
 
     # Auto-create default config if missing (useful for first run / frozen builds)
-    if not config_path.startswith("-"):
-        _ensure_config(config_path)
-
-    cfg = load_config(config_path)
+    try:
+        if not config_path.startswith("-"):
+            _ensure_config(config_path)
+        cfg = load_config(config_path)
+    except Exception as e:
+        print(f"ERROR: could not load config '{config_path}': {e}", file=sys.stderr)
+        print(
+            "Fix the config file, or copy a fresh config.yaml next to the program "
+            "and restart. Run as: python run.py <path-to-config.yaml>",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     log_dir = os.path.dirname(cfg.logging.file) if cfg.logging.file else ""
     logger = setup_logging(log_dir, cfg.logging.file, cfg.logging.level)
@@ -114,11 +122,14 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # ── Create EventStore (persistent event log for at-least-once delivery) ──
+    event_store = EventStore("event_store.db")
+
     # ── Create bridge ────────────────────────────────────────
-    bridge = CopyTradeBridge(cfg, state, event_queue, loop)
+    bridge = CopyTradeBridge(cfg, state, event_queue, loop, event_store)
 
     # ── Create aiohttp app ────────────────────────────────────
-    app = create_app(state, event_queue, cfg, config_path, bridge)
+    app = create_app(state, event_queue, cfg, config_path, bridge, event_store)
     runner = web.AppRunner(app)
 
     async def start_server():
@@ -151,8 +162,12 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        loop.run_until_complete(runner.cleanup())
+        try:
+            loop.run_until_complete(runner.cleanup())
+        except Exception:
+            logger.exception("Error during server cleanup")
         loop.close()
+        event_store.close()
 
     logger.info("Shutdown complete.")
 

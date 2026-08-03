@@ -202,6 +202,9 @@
     padding:12px 20px; font-size:13px; box-shadow:0 8px 32px rgba(0,0,0,.6);
     transform:translateY(100px); opacity:0; transition:all .3s ease;
   }
+  .state-badge { font-size:10px;padding:2px 8px;border-radius:10px;background:var(--accent);color:#fff;margin-left:6px; }
+  .state-badge.yellow { background:var(--yellow);color:#000; }
+  .state-badge.red { background:var(--red); }
   .toast.show { transform:translateY(0); opacity:1; }
   .toast.success { border-color:var(--green); }
   .toast.error { border-color:var(--red); }
@@ -297,7 +300,10 @@
   <!-- ================ AGENTS ================ -->
   <div class="tab-content" id="tab-agents">
     <div class="page-header">
-      <h2>Agents</h2>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h2>Agents</h2>
+        <button class="btn btn-primary" onclick="openDeployModal()">+ Add Agent</button>
+      </div>
       <p>Connected follower terminals <span id="agent-count" style="color:var(--accent)"></span></p>
     </div>
     <div class="agent-grid" id="agent-grid"></div>
@@ -393,6 +399,118 @@
 </div>
 
 <div class="toast" id="toast"></div>
-<script src="/static/app.js?v=2"></script>
+
+<!-- ── Deploy Agent Modal ──────────────────────────── -->
+<div class="modal-overlay" id="deploy-modal" style="display:none" onclick="closeDeployModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h3 id="modal-title">Configure Agent</h3>
+      <span class="modal-close" onclick="closeDeployModal()">&times;</span>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <div class="form-group">
+          <label>Agent Name</label>
+          <input id="deploy-name" class="cfg-input" placeholder="e.g. server004">
+        </div>
+        <div class="form-group">
+          <label>Hub URL</label>
+          <input id="deploy-hub" class="cfg-input" placeholder="http://HUB_IP:5000">
+        </div>
+      </div>
+      <div class="form-row-3">
+        <div class="form-group">
+          <label>MT5 Path</label>
+          <input id="deploy-path" class="cfg-input" value="C:\Program Files\MetaTrader 5\terminal64.exe">
+        </div>
+        <div class="form-group">
+          <label>Login</label>
+          <input id="deploy-login" class="cfg-input" type="number" placeholder="Exness login">
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input id="deploy-password" class="cfg-input" type="password" placeholder="investor password">
+        </div>
+      </div>
+      <div class="form-row-3">
+        <div class="form-group">
+          <label>Server</label>
+          <input id="deploy-server" class="cfg-input" placeholder="Exness-MT5Trial7">
+        </div>
+        <div class="form-group" style="display:flex;align-items:flex-end;gap:12px;padding-bottom:4px">
+          <label style="flex:1">Skip Auto Trading <input id="deploy-skip-at" type="checkbox" checked></label>
+          <label style="flex:1">Install MT5 <input id="deploy-install" type="checkbox" checked></label>
+        </div>
+        <div class="form-group">
+          <label>Magic #</label>
+          <input id="deploy-magic" class="cfg-input" type="number" value="951001">
+        </div>
+      </div>
+      <div class="form-row-3">
+        <div class="form-group">
+          <label>Lot Multiplier</label>
+          <input id="deploy-lotmult" class="cfg-input" type="number" step="0.01" min="0.01" max="10" value="1.0">
+        </div>
+        <div class="form-group">
+          <label>Max Lot</label>
+          <input id="deploy-maxlot" class="cfg-input" type="number" step="0.01" min="0.01" value="1.0">
+        </div>
+        <div class="form-group">
+          <label>Min Lot</label>
+          <input id="deploy-minlot" class="cfg-input" type="number" step="0.01" min="0.00" value="0.01">
+        </div>
+      </div>
+      <div class="form-row-3">
+        <div class="form-group">
+          <label>Max Positions</label>
+          <input id="deploy-maxpos" class="cfg-input" type="number" min="1" value="10">
+        </div>
+        <div class="form-group">
+          <label>Deviation (pts)</label>
+          <input id="deploy-deviation" class="cfg-input" type="number" min="0" value="50">
+        </div>
+        <div class="form-group">
+          <label>Max Daily Loss</label>
+          <input id="deploy-maxloss" class="cfg-input" type="number" min="0" step="10" value="0" placeholder="0 = unlimited">
+        </div>
+      </div>
+      <div class="form-row-3">
+        <div class="form-group">
+          <label>Max Drawdown %</label>
+          <input id="deploy-drawdown" class="cfg-input" type="number" min="0" step="1" value="0" placeholder="0 = unlimited">
+        </div>
+        <div class="form-group">
+          <label>Max Daily Trades</label>
+          <input id="deploy-dailytrades" class="cfg-input" type="number" min="0" value="0" placeholder="0 = unlimited">
+        </div>
+        <div class="form-group" style="display:flex;flex-direction:column;justify-content:flex-end">
+          <div id="deploy-progress" style="display:none;font-size:13px;color:var(--accent)">
+            <span id="deploy-status-msg">Deploying...</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeDeployModal()">Cancel</button>
+      <button class="btn btn-primary" id="deploy-btn" onclick="deployAgent()">Deploy Agent</button>
+    </div>
+  </div>
+</div>
+
+<style>
+  .modal-overlay { position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center; }
+  .modal { background:var(--card);border:1px solid var(--border);border-radius:16px;width:640px;max-width:90vw;max-height:85vh;overflow-y:auto; }
+  .modal-header { display:flex;justify-content:space-between;align-items:center;padding:18px 24px;border-bottom:1px solid var(--border); }
+  .modal-header h3 { font-size:16px;font-weight:600; }
+  .modal-close { font-size:22px;cursor:pointer;color:var(--text-dim);padding:0 4px; }
+  .modal-close:hover { color:var(--text); }
+  .modal-body { padding:20px 24px; }
+  .modal-footer { display:flex;justify-content:flex-end;gap:10px;padding:14px 24px;border-top:1px solid var(--border); }
+  .modal-footer .btn { min-width:100px; }
+  .modal .form-group { margin-bottom:0; }
+  .modal .form-row, .modal .form-row-3 { margin-bottom:12px; }
+</style>
+
+<script src="/static/app.js?v=4"></script>
 </body>
 </html>

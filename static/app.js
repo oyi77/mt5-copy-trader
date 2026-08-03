@@ -23,7 +23,7 @@
   var pnlSign = function(v) { return v > 0 ? '+' : ''; };
   var fmtTime = function(ts) { return ts ? new Date(ts*1000).toLocaleTimeString() : '\u2014'; };
   var fmtDur = function(s) { return s > 0 ? (s > 3600 ? (s/3600).toFixed(1)+'h' : (s > 60 ? Math.floor(s/60)+'m' : Math.floor(s)+'s')) : '0s'; };
-  var currSym = function(c) { return ({USD:'$', USC:'\u20B5', EUR:'\u20AC', GBP:'\u00A3', JPY:'\u00A5', AUD:'A$', CAD:'C$', CHF:'Fr', NZD:'NZ$'}[c]||c+' '); };
+  var currSym = function(c) { return ({USD:'$', USC:'\u20B5', EUR:'\u20AC', GBP:'\u00A3', JPY:'\u00A5', AUD:'A$', CAD:'C$', CHF:'Fr', NZD:'NZ$'}[c]||escHtml(c)+' '); };
 
   // ── Toast ──────────────────────────────────────────────
   var tt;
@@ -80,28 +80,64 @@
   });
 
   // ── Data Stream ────────────────────────────────────────
-  var usePoll = false, latestData = null, latestPortfolio = null;
+  var latestData = null, latestPortfolio = null;
+  var lastSseTick = Date.now();
+  var pollTimer = null;
+
+  function isInputFocused() {
+    var el = document.activeElement;
+    return !!(el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable));
+  }
+
+  function startPoll() {
+    if (pollTimer) return;
+    pollTimer = setInterval(async function() {
+      try {
+        var d = await (await fetch('/api/status')).json();
+        latestData = d; latestPortfolio = d.portfolio;
+        renderDashboard(d);
+      } catch(_) {}
+    }, 2000);
+  }
+
+  function stopPoll() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
 
   function connectSSE() {
     var src = new EventSource('/api/stream');
+    src.onopen = function() { lastSseTick = Date.now(); };
     src.onmessage = function(e) {
+      lastSseTick = Date.now();
+      stopPoll(); // SSE is delivering ticks again — drop the polling fallback
       try {
         var d = JSON.parse(e.data);
         latestData = d; latestPortfolio = d.portfolio;
         renderDashboard(d);
-        if ($('tab-agents').classList.contains('active')) loadAgents();
-        if ($('tab-accounts').classList.contains('active')) loadAccounts();
       } catch(_) {}
     };
-    src.onerror = function() { src.close(); usePoll = true; };
+    // Do NOT call src.close() here: EventSource reconnects automatically on
+    // error, and the watchdog below switches to polling while it is down.
+    src.onerror = function() {};
   }
-  function startPoll() {
-    setInterval(async function() {
-      try { var d = await(await fetch('/api/status')).json(); latestData = d; latestPortfolio = d.portfolio; renderDashboard(d); } catch(_) {}
-    }, 2000);
-  }
+
   connectSSE();
-  setTimeout(function() { if (usePoll) startPoll(); }, 5000);
+
+  // Watchdog: if SSE misses ticks for >8s, switch to polling. Polling stops by
+  // itself as soon as SSE delivers a tick again (see onmessage above).
+  setInterval(function() {
+    if (Date.now() - lastSseTick > 8000) startPoll();
+  }, 2000);
+
+  // The Agents/Accounts tabs are no longer rebuilt on every SSE tick (that
+  // wiped whatever the user was typing in config inputs). Refresh instead on
+  // tab activation, on user actions, and on this slower interval — and never
+  // while an input is focused.
+  setInterval(function() {
+    if (isInputFocused()) return;
+    if ($('tab-agents').classList.contains('active')) loadAgents();
+    if ($('tab-accounts').classList.contains('active')) loadAccounts();
+  }, 10000);
 
   // ── Equity Chart ───────────────────────────────────────
   var chartData = [];
@@ -196,13 +232,13 @@
       var vol = p.volume || p.lots || 0;
       var typeCls = typeStr.toLowerCase().replace(/ /g,'-');
       h += '<tr>';
-      h += '<td><strong>'+(p.symbol || '\u2014')+'</strong></td>';
+      h += '<td><strong>'+escHtml(p.symbol || '\u2014')+'</strong></td>';
       h += '<td class="type-'+typeCls+'">'+typeStr+'</td>';
-      h += '<td>'+vol+'</td>';
-      h += '<td>'+(p.price_open || p.open_price || '\u2014')+'</td>';
-      h += '<td>'+(p.price_current || p.current_price || '\u2014')+'</td>';
-      h += '<td>'+(p.sl || p.stop_loss || '\u2014')+'</td>';
-      h += '<td>'+(p.tp || p.take_profit || '\u2014')+'</td>';
+      h += '<td>'+escHtml(vol)+'</td>';
+      h += '<td>'+escHtml(p.price_open || p.open_price || '\u2014')+'</td>';
+      h += '<td>'+escHtml(p.price_current || p.current_price || '\u2014')+'</td>';
+      h += '<td>'+escHtml(p.sl || p.stop_loss || '\u2014')+'</td>';
+      h += '<td>'+escHtml(p.tp || p.take_profit || '\u2014')+'</td>';
       h += '<td class="'+pnlCls(profit)+'">'+pnlSign(profit)+T(profit)+' '+sym+'</td>';
       h += '<td>'+fmtDur(dur)+'</td>';
       h += '</tr>';
@@ -213,6 +249,7 @@
 
   // ── Account Detail Builder ──────────────────────────────
   function buildAccountCard(acc, isMaster) {
+    var state = acc.state || 'trading';
     var sym = currSym(acc.currency || 'USD');
     var posCount = acc.position_count || (acc.positions || []).length;
     var pnl = acc.unrealized_pnl || 0;
@@ -220,14 +257,20 @@
     var posHtml = acc.positions && acc.positions.length ? buildPositionTable(acc.positions, acc.currency) : '';
     var safeId = acc.name.replace(/[^a-zA-Z0-9_-]/g, '_');
 
-    var h = '<div class="agent-card" data-acc="'+acc.name.replace(/"/g,'&quot;')+'">';
-    h += '<div class="agent-main" data-toggle="positions">';
+    var h = '<div class="agent-card" data-acc="'+escHtml(acc.name)+'" data-state="'+escHtml(state)+'">';
+    h += '<div class="agent-main'+(isMaster?'':'" data-toggle="positions"')+'>';
     h += '<div class="agent-left">';
-    h += '<span class="dot '+(acc.connected?'green':'red')+'"></span>';
+    // Dot color based on state
+    var dotCls = 'green';
+    if (state === 'unconfigured') dotCls = 'yellow';
+    else if (state === 'deploying') dotCls = 'yellow';
+    else if (state === 'error') dotCls = 'red';
+    else if (!acc.connected) dotCls = 'red';
+    h += '<span class="dot '+dotCls+'"></span>';
     h += '<div><strong>'+escHtml(acc.name)+'</strong>';
     h += '<span class="agent-sub">'+(isMaster?'MASTER':'AGENT');
     if (acc.server) h += ' &middot; '+escHtml(acc.server);
-    h += ' &middot; '+(acc.account_login||'');
+    if (acc.account_login) h += ' &middot; '+escHtml(acc.account_login);
     // Agent identity info
     if (!isMaster && acc.hostname) {
       h += ' &middot; '+escHtml(acc.hostname);
@@ -235,24 +278,39 @@
     if (!isMaster && acc.version) {
       h += ' &middot; v'+escHtml(acc.version);
     }
+    // State badge for non-trading agents
+    if (state !== 'trading') {
+      var badgeCls = state === 'error' ? 'red' : (state === 'deploying' ? 'yellow' : '');
+      h += ' <span class="state-badge '+badgeCls+'">'+escHtml(state)+'</span>';
+    }
     h += '</span></div></div>';
     h += '<div class="agent-metrics">';
-    h += '<div class="metric"><div class="mv">'+sym+fmt(acc.balance)+'</div><div class="ml">Balance</div></div>';
-    h += '<div class="metric"><div class="mv">'+sym+fmt(acc.equity)+'</div><div class="ml">Equity</div></div>';
-    h += '<div class="metric"><div class="mv '+pnlCls(pnl)+'">'+pnlSign(pnl)+fmt(pnl)+'</div><div class="ml">PnL</div></div>';
-    h += '<div class="metric"><div class="mv">'+ml+'</div><div class="ml">Margin</div></div>';
-    h += '<div class="metric"><div class="mv">'+posCount+'</div><div class="ml">Positions <span class="expand-icon">'+(posHtml?'\u25B8':'')+'</span></div></div>';
-    if (!isMaster) {
-      var latCls = acc.latency_ms < 100 ? 'ok' : (acc.latency_ms < 300 ? 'warn' : 'bad');
-      h += '<div class="metric"><div class="mv latency-'+latCls+'">'+(acc.latency_ms||'\u2014')+'ms</div>'+
-           '<div class="ml">Latency</div></div>';
-      h += '<div class="metric"><button class="btn btn-sm" data-toggle="ping">Ping</button></div>';
-      if (acc.config_overrides && Object.keys(acc.config_overrides).length > 0) {
-        h += '<div class="metric"><div class="mv" style="font-size:11px;color:var(--accent)">config</div><div class="ml">'+Object.keys(acc.config_overrides).join(', ')+'</div></div>';
+    if (state === 'unconfigured') {
+      // Minimal display for unconfigured agents
+      h += '<div class="metric"><div class="mv" style="color:var(--yellow);font-size:12px">Pending</div><div class="ml">Status</div></div>';
+      h += '<div class="metric"><div class="mv" style="font-size:12px">'+escHtml(acc.hostname||acc.name)+'</div><div class="ml">Hostname</div></div>';
+      h += '<div class="metric"><button class="btn btn-primary btn-sm" onclick="openDeployModal(\''+escJsAttr(acc.name)+'\')">Configure</button></div>';
+    } else if (state === 'deploying') {
+      h += '<div class="metric"><div class="mv" style="color:var(--accent);font-size:12px"><span id="deploy-state-'+safeId+'">Installing...</span></div><div class="ml">Status</div></div>';
+    } else {
+      // Normal trading display
+      h += '<div class="metric"><div class="mv">'+sym+fmt(acc.balance)+'</div><div class="ml">Balance</div></div>';
+      h += '<div class="metric"><div class="mv">'+sym+fmt(acc.equity)+'</div><div class="ml">Equity</div></div>';
+      h += '<div class="metric"><div class="mv '+pnlCls(pnl)+'">'+pnlSign(pnl)+fmt(pnl)+'</div><div class="ml">PnL</div></div>';
+      h += '<div class="metric"><div class="mv">'+ml+'</div><div class="ml">Margin</div></div>';
+      h += '<div class="metric"><div class="mv">'+posCount+'</div><div class="ml">Positions <span class="expand-icon">'+(posHtml?'\u25B8':'')+'</span></div></div>';
+      if (!isMaster) {
+        var latCls = acc.latency_ms < 100 ? 'ok' : (acc.latency_ms < 300 ? 'warn' : 'bad');
+        h += '<div class="metric"><div class="mv latency-'+latCls+'">'+escHtml(acc.latency_ms||'\u2014')+'ms</div>'+
+             '<div class="ml">Latency</div></div>';
+        h += '<div class="metric"><button class="btn btn-sm" data-toggle="ping">Ping</button></div>';
+        if (acc.config_overrides && Object.keys(acc.config_overrides).length > 0) {
+          h += '<div class="metric"><div class="mv" style="font-size:11px;color:var(--accent)">config</div><div class="ml">'+escHtml(Object.keys(acc.config_overrides).join(', '))+'</div></div>';
+        }
       }
     }
     h += '</div></div>';
-    if (posHtml) {
+    if (posHtml && state === 'trading') {
       h += '<div class="positions-panel" id="pos-'+safeId+'">'+posHtml+'</div>';
     }
     h += '</div>';
@@ -260,8 +318,28 @@
   }
 
   function escHtml(s) {
-    if (!s) return '';
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/\//g,'&#47;');
+  }
+
+  // Escapes a value for embedding inside a single-quoted JS string within an
+  // inline onclick attribute. HTML-escapes first (attribute context, so the
+  // outer double quotes stay closed), then JS-escapes. ' is emitted as \u0027
+  // instead of &#39; — the HTML parser would decode &#39; back to a quote
+  // before the JS runs, which both breaks the handler and re-enables XSS.
+  function escJsAttr(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;')
+      .replace(/\\/g,'\\\\')
+      .replace(/'/g,'\\u0027')
+      .replace(/\r/g,'\\r')
+      .replace(/\n/g,'\\n')
+      .replace(/\u2028/g,'\\u2028')
+      .replace(/\u2029/g,'\\u2029');
   }
 
   // ── Dashboard Render ───────────────────────────────────
@@ -285,7 +363,7 @@
       '<div class="pf-card" data-pf="equity"><div class="lbl">Total Equity</div><div class="val">$'+fmt(portfolio.total_equity)+'</div><div class="sub">with floating PnL</div><div class="mini-bar" style="width:'+Math.min(100,portfolio.total_margin_free/portfolio.total_equity*100||0)+'%;background:var(--green)"></div></div>'+
       '<div class="pf-card" data-pf="pnl"><div class="lbl">Floating PnL</div><div class="val '+pnlCls(portfolio.total_floating_pnl)+'">'+pnlSign(portfolio.total_floating_pnl)+'$'+fmt(portfolio.total_floating_pnl)+'</div><div class="sub">unrealized</div><div class="mini-bar" style="width:50%;background:'+(portfolio.total_floating_pnl>=0?'var(--green)':'var(--red)')+'"></div></div>'+
       '<div class="pf-card" data-pf="margin"><div class="lbl">Free Margin</div><div class="val">$'+fmt(portfolio.total_margin_free)+'</div><div class="sub">equity - margin</div><div class="mini-bar" style="width:'+Math.min(100,portfolio.total_margin_free/(portfolio.total_equity||1)*100)+'%;background:var(--yellow)"></div></div>'+
-      '<div class="pf-card" data-pf="positions"><div class="lbl">Total Positions</div><div class="val">'+portfolio.total_positions+'</div><div class="sub">'+portfolio.connected_agents+' agents connected</div><div class="mini-bar" style="width:'+Math.min(100,portfolio.total_positions*5)+'%;background:var(--accent)"></div></div>';
+      '<div class="pf-card" data-pf="positions"><div class="lbl">Total Positions</div><div class="val">'+escHtml(portfolio.total_positions)+'</div><div class="sub">'+escHtml(portfolio.connected_agents)+' agents connected</div><div class="mini-bar" style="width:'+Math.min(100,portfolio.total_positions*5)+'%;background:var(--accent)"></div></div>';
 
     // Value-only update for portfolio
     var curPf = $('portfolio-grid');
@@ -305,7 +383,7 @@
       '<div class="stat-card" data-stat="cycles"><div class="lbl">Cycles</div><div class="val">'+fmt(stats.cycles,0)+'</div></div>'+
       '<div class="stat-card" data-stat="events"><div class="lbl">Events</div><div class="val">'+fmt(stats.events_detected,0)+'</div></div>'+
       '<div class="stat-card" data-stat="tickets"><div class="lbl">Tickets</div><div class="val">'+fmt(stats.known_tickets,0)+'</div></div>'+
-      '<div class="stat-card" data-stat="errors"><div class="lbl">Errors</div><div class="val" style="color:'+(stats.errors>0?'var(--red)':'')+'">'+stats.errors+'</div></div>';
+      '<div class="stat-card" data-stat="errors"><div class="lbl">Errors</div><div class="val" style="color:'+(stats.errors>0?'var(--red)':'')+'">'+escHtml(stats.errors)+'</div></div>';
     var curStats = $('stats-row');
     if (_firstRender || curStats.children.length === 0) {
       curStats.innerHTML = statsHtml;
@@ -367,6 +445,132 @@
     var el = container.querySelector('[data-stat="'+key+'"] .val');
     if (el) el.textContent = val;
   }
+
+  // ── Deploy Modal ────────────────────────────────────────
+  var deployTargetName = '';
+
+  function openDeployModal(agentName) {
+    deployTargetName = agentName || '';
+    var modal = $('deploy-modal');
+    if (!modal) return;
+    modal.style.display = 'flex';
+    $('modal-title').textContent = agentName ? 'Configure: '+agentName : 'Add New Agent';
+    $('deploy-name').value = agentName || '';
+    $('deploy-hub').value = window.location.origin;
+    $('deploy-progress').style.display = 'none';
+    $('deploy-btn').disabled = false;
+    $('deploy-btn').textContent = 'Deploy Agent';
+  }
+
+  function closeDeployModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    var modal = $('deploy-modal');
+    if (modal) modal.style.display = 'none';
+  }
+
+  async function deployAgent() {
+    var name = $('deploy-name').value.trim();
+    if (!name) { toast('Agent name is required','error'); return; }
+    var login = parseInt($('deploy-login').value);
+    if (!login) { toast('Login is required','error'); return; }
+    var password = $('deploy-password').value.trim();
+    if (!password) { toast('Password is required','error'); return; }
+    var server = $('deploy-server').value.trim();
+    if (!server) { toast('Server is required','error'); return; }
+
+    var config = {
+      name: name,
+      path: $('deploy-path').value.trim() || 'C:\\Program Files\\MetaTrader 5\\terminal64.exe',
+      port: 0,
+      login: login,
+      password: password,
+      server: server,
+      skip_auto_trading: $('deploy-skip-at').checked,
+      install_mt5: $('deploy-install').checked,
+      magic: parseInt($('deploy-magic').value) || 951001,
+      lot_multiplier: parseFloat($('deploy-lotmult').value) || 1.0,
+      max_lot: parseFloat($('deploy-maxlot').value) || 1.0,
+      min_lot: parseFloat($('deploy-minlot').value) || 0.01,
+      max_positions: parseInt($('deploy-maxpos').value) || 10,
+      deviation: parseInt($('deploy-deviation').value) || 50,
+      max_daily_loss: parseFloat($('deploy-maxloss').value) || 0,
+      max_drawdown_pct: parseFloat($('deploy-drawdown').value) || 0,
+      max_daily_trades: parseInt($('deploy-dailytrades').value) || 0,
+    };
+
+    $('deploy-btn').disabled = true;
+    $('deploy-btn').textContent = 'Deploying...';
+    $('deploy-progress').style.display = 'block';
+    $('deploy-status-msg').textContent = 'Pushing config to agent...';
+
+    try {
+      var resp = await fetch('/api/agents/'+encodeURIComponent(name)+'/deploy', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(config),
+      });
+      var result = await resp.json();
+      if (resp.ok) {
+        $('deploy-status-msg').textContent = 'Config sent to agent. Agent will install MT5 and start trading...';
+        toast('Deploy config sent to '+name);
+        // Start polling progress
+        pollDeployProgress(name);
+      } else {
+        $('deploy-status-msg').textContent = 'Error: '+(result.error||resp.statusText);
+        $('deploy-btn').disabled = false;
+        $('deploy-btn').textContent = 'Deploy Agent';
+        toast('Deploy failed: '+result.error,'error');
+      }
+    } catch(e) {
+      $('deploy-status-msg').textContent = 'Network error: '+e.message;
+      $('deploy-btn').disabled = false;
+      $('deploy-btn').textContent = 'Deploy Agent';
+      toast('Deploy failed: '+e.message,'error');
+    }
+  }
+
+  function pollDeployProgress(name) {
+    var attempts = 0;
+    var maxAttempts = 30;
+    var iv = setInterval(async function() {
+      attempts++;
+      if (attempts > maxAttempts) {
+        clearInterval(iv);
+        $('deploy-status-msg').textContent = 'Deploy timed out. Check agent status in the dashboard.';
+        $('deploy-btn').disabled = false;
+        $('deploy-btn').textContent = 'Done';
+        return;
+      }
+      try {
+        var r = await(await fetch('/api/agents/'+encodeURIComponent(name))).json();
+        if (r && r.state) {
+          if (r.state === 'trading') {
+            clearInterval(iv);
+            $('deploy-status-msg').textContent = 'Agent is now trading!';
+            $('deploy-btn').disabled = false;
+            $('deploy-btn').textContent = 'Done';
+            toast(name+' is now trading!','success');
+            setTimeout(function() { closeDeployModal(); }, 1500);
+          } else if (r.state === 'error') {
+            clearInterval(iv);
+            $('deploy-status-msg').textContent = 'Deploy failed. Check agent logs.';
+            $('deploy-btn').disabled = false;
+            $('deploy-btn').textContent = 'Retry';
+            toast(name+' deploy error','error');
+          } else {
+            $('deploy-status-msg').textContent = 'Status: '+r.state+'...';
+          }
+        }
+      } catch(e) {}
+    }, 3000);
+  }
+
+  // Expose deploy modal functions to window for inline onclick handlers
+  window.openDeployModal = openDeployModal;
+  window.closeDeployModal = closeDeployModal;
+  window.deployAgent = deployAgent;
+  window.saveAgentConfig = saveAgentConfig;
+  window.pushAgentConfig = pushAgentConfig;
 
   // ── Agents Tab ─────────────────────────────────────────
   function loadAgents() {
@@ -434,7 +638,7 @@
 
   function buildAgentConfig(acc) {
     var overrides = acc.config_overrides || {};
-    var name = acc.name.replace(/"/g,'&quot;');
+    var name = escHtml(acc.name);
     var safeId = acc.name.replace(/[^a-zA-Z0-9_-]/g, '_');
     var h = '<div class="config-panel" id="cfg-'+safeId+'" data-acc="'+name+'">';
     h += '<div class="config-header"><button class="btn btn-sm" data-toggle="config">Config</button>';
@@ -442,23 +646,23 @@
     h += '<div class="config-fields">';
     // Lot multiplier
     h += '<div class="cfg-row"><label>Lot Multiplier</label>';
-    h += '<input type="number" step="0.01" min="0.01" max="10" class="cfg-input" id="cfg-'+safeId+'-mult" value="'+(overrides.lot_multiplier||1.0)+'"></div>';
+    h += '<input type="number" step="0.01" min="0.01" max="10" class="cfg-input" id="cfg-'+safeId+'-mult" value="'+escHtml(overrides.lot_multiplier||1.0)+'"></div>';
     // Max lot
     h += '<div class="cfg-row"><label>Max Lot</label>';
-    h += '<input type="number" step="0.01" min="0.01" class="cfg-input" id="cfg-'+safeId+'-maxlot" value="'+(overrides.max_lot||10.0)+'"></div>';
+    h += '<input type="number" step="0.01" min="0.01" class="cfg-input" id="cfg-'+safeId+'-maxlot" value="'+escHtml(overrides.max_lot||10.0)+'"></div>';
     // Deviation
     h += '<div class="cfg-row"><label>Deviation (pts)</label>';
-    h += '<input type="number" step="1" min="0" class="cfg-input" id="cfg-'+safeId+'-dev" value="'+(overrides.deviation||20)+'"></div>';
+    h += '<input type="number" step="1" min="0" class="cfg-input" id="cfg-'+safeId+'-dev" value="'+escHtml(overrides.deviation||20)+'"></div>';
     // Max positions
     h += '<div class="cfg-row"><label>Max Positions</label>';
-    h += '<input type="number" step="1" min="1" class="cfg-input" id="cfg-'+safeId+'-maxpos" value="'+(overrides.max_positions||20)+'"></div>';
+    h += '<input type="number" step="1" min="1" class="cfg-input" id="cfg-'+safeId+'-maxpos" value="'+escHtml(overrides.max_positions||20)+'"></div>';
     // Magic number
     h += '<div class="cfg-row"><label>Magic #</label>';
-    h += '<input type="number" step="1" class="cfg-input" id="cfg-'+safeId+'-magic" value="'+(overrides.magic||951001)+'"></div>';
+    h += '<input type="number" step="1" class="cfg-input" id="cfg-'+safeId+'-magic" value="'+escHtml(overrides.magic||951001)+'"></div>';
     h += '</div>';
     h += '<div class="config-actions">';
-    h += '<button class="btn btn-primary btn-sm" onclick="saveAgentConfig(\''+escHtml(acc.name)+'\')">Save Config</button>';
-    h += '<button class="btn btn-sm" onclick="pushAgentConfig(\''+escHtml(acc.name)+'\')" style="border-color:var(--accent);color:var(--accent)">Push to Agent</button>';
+    h += '<button class="btn btn-primary btn-sm" onclick="saveAgentConfig(\''+escJsAttr(acc.name)+'\')">Save Config</button>';
+    h += '<button class="btn btn-sm" onclick="pushAgentConfig(\''+escJsAttr(acc.name)+'\')" style="border-color:var(--accent);color:var(--accent)">Push to Agent</button>';
     h += '</div></div>';
     return h;
   }
@@ -479,6 +683,7 @@
         body: JSON.stringify(config),
       })).json();
       toast('Config saved for '+name);
+      loadAgents();
     } catch(e) { toast('Save failed: '+e,'error'); }
   }
 
@@ -498,6 +703,7 @@
         body: JSON.stringify(config),
       })).json();
       toast('Config pushed to '+name);
+      loadAgents();
     } catch(e) { toast('Push failed: '+e,'error'); }
   }
 
@@ -553,17 +759,17 @@
 
         h += '<tr data-idx="'+i+'" data-acc="'+escHtml(a.name)+'">';
         h += '<td><span class="acc-type-badge '+typeCls+'">'+typeLabel+'</span></td>';
-        h += '<td class="acc-name">'+(a.name||'\u2014')+'</td>';
-        h += '<td>'+(a.server||'\u2014')+'</td>';
-        h += '<td>'+(a.login || a.account_login || '\u2014')+'</td>';
+        h += '<td class="acc-name">'+escHtml(a.name||'\u2014')+'</td>';
+        h += '<td>'+escHtml(a.server||'\u2014')+'</td>';
+        h += '<td>'+escHtml(a.login || a.account_login || '\u2014')+'</td>';
         h += '<td data-cel="bal">'+sym+fmt(a.balance||0)+'</td>';
         h += '<td data-cel="eq">'+sym+fmt(a.equity||0)+'</td>';
         h += '<td data-cel="pnl" class="'+pnlCl+'">'+sym+fmt(a.unrealized_pnl||0)+'</td>';
         h += '<td data-cel="mar">'+sym+fmt(a.margin||0)+'</td>';
         h += '<td data-cel="fm">'+sym+fmt(a.margin_free||0)+'</td>';
         h += '<td data-cel="ml">'+(a.margin_level ? fmt(a.margin_level,1)+'%' : '\u2014')+'</td>';
-        h += '<td data-cel="lev">'+(a.leverage ? '1:'+a.leverage : '\u2014')+'</td>';
-        h += '<td data-cel="posc">'+(a.position_count||0)+'</td>';
+        h += '<td data-cel="lev">'+(a.leverage ? '1:'+escHtml(a.leverage) : '\u2014')+'</td>';
+        h += '<td data-cel="posc">'+escHtml(a.position_count||0)+'</td>';
         h += '<td data-cel="lat">'+(a.latency_ms != null ? fmt(a.latency_ms,0)+'ms' : '\u2014')+'</td>';
         h += '<td><span class="btn-icon toggle-acc-positions" data-idx="'+i+'" title="Toggle positions">\u25B8</span></td>';
         h += '</tr>';
@@ -586,8 +792,8 @@
 
     var h = '<div class="acc-detail">';
     h += '<div class="ad-header">';
-    h += '<div><span class="dot '+(connected?'green':'red')+'"></span> <strong>'+escHtml(acc.name)+'</strong> &middot; '+(acc.server||'\u2014')+' &middot; Login '+(acc.login||acc.account_login||'\u2014')+'</div>';
-    h += '<span style="font-size:12px;color:var(--text-dim)">Currency: '+(sym||acc.currency||'USD')+' | Leverage: '+(acc.leverage ? '1:'+acc.leverage : '\u2014')+' | Uptime: '+dur+'</span>';
+    h += '<div><span class="dot '+(connected?'green':'red')+'"></span> <strong>'+escHtml(acc.name)+'</strong> &middot; '+escHtml(acc.server||'\u2014')+' &middot; Login '+escHtml(acc.login||acc.account_login||'\u2014')+'</div>';
+    h += '<span style="font-size:12px;color:var(--text-dim)">Currency: '+(sym||escHtml(acc.currency)||'USD')+' | Leverage: '+(acc.leverage ? '1:'+escHtml(acc.leverage) : '\u2014')+' | Uptime: '+escHtml(dur)+'</span>';
     h += '</div>';
     h += '<div class="ad-metrics">';
     h += '<div class="adm"><div class="l">Balance</div><div class="v">'+sym+fmt(acc.balance||0)+'</div></div>';
@@ -628,7 +834,7 @@
       var html = '';
       for (var i = events.length - 1; i >= 0; i--) {
         var e = events[i];
-        html += '<div class="activity-entry"><span class="at">'+fmtTime(e.t)+'</span><span class="tag '+e.type+'">'+e.type+'</span><span class="msg">'+escHtml(e.msg)+'</span></div>';
+        html += '<div class="activity-entry"><span class="at">'+fmtTime(e.t)+'</span><span class="tag '+escHtml(e.type)+'">'+escHtml(e.type)+'</span><span class="msg">'+escHtml(e.msg)+'</span></div>';
       }
       list.innerHTML = html;
     } catch(_) {}
@@ -709,10 +915,10 @@
           '<button class="btn btn-sm" data-toggle="download-agent" data-fname="'+name+'">Download</button>'+
           '<button class="btn btn-sm btn-danger" data-toggle="delete-follower" data-fname="'+name+'">Delete</button>';
         html += '</div></div><div class="fd">';
-        html += '<span>Login: '+(f.login||'\u2014')+'</span><span>Server: '+(f.server||'\u2014')+'</span>';
-        html += '<span>Lot: '+(f.lot_multiplier||1)+'x</span><span>Port: '+(f.port||'\u2014')+'</span>';
+        html += '<span>Login: '+escHtml(f.login||'\u2014')+'</span><span>Server: '+escHtml(f.server||'\u2014')+'</span>';
+        html += '<span>Lot: '+escHtml(f.lot_multiplier||1)+'x</span><span>Port: '+escHtml(f.port||'\u2014')+'</span>';
         html += '<span>'+(f.has_password?'OK pw':'NO pw')+'</span>';
-        if (active) html += '<span>Events OK: '+evOk+'</span><span>Errors: '+errCount+'</span>';
+        if (active) html += '<span>Events OK: '+escHtml(evOk)+'</span><span>Errors: '+escHtml(errCount)+'</span>';
         html += '</div></div>';
       }
       c.innerHTML = html;
@@ -727,8 +933,8 @@
           '<button class="btn btn-sm" data-toggle="download-agent" data-fname="'+name+'">Download</button>'+
           '<button class="btn btn-sm btn-danger" data-toggle="delete-follower" data-fname="'+name+'">Delete</button>'+
           '</div></div><div class="fd">'+
-          '<span>Login: '+(f.login||'\u2014')+'</span><span>Server: '+(f.server||'\u2014')+'</span>'+
-          '<span>Lot: '+(f.lot_multiplier||1)+'x</span><span>Port: '+(f.port||'\u2014')+'</span>'+
+          '<span>Login: '+escHtml(f.login||'\u2014')+'</span><span>Server: '+escHtml(f.server||'\u2014')+'</span>'+
+          '<span>Lot: '+escHtml(f.lot_multiplier||1)+'x</span><span>Port: '+escHtml(f.port||'\u2014')+'</span>'+
           '<span>'+(f.has_password?'OK pw':'NO pw')+'</span></div></div>';
       }
       c.innerHTML = html;
@@ -761,6 +967,10 @@
   };
 
   function editFollower(name) {
+    if (!currentConfig || !Array.isArray(currentConfig.followers)) {
+      toast('Config not loaded yet','error');
+      return;
+    }
     var f = currentConfig.followers.find(function(x) { return x.name === name; });
     if (!f) return;
     window.showAddFollower();
@@ -849,14 +1059,23 @@
 
   function downloadAgent(name) {
     fetch('/api/config/export-agent?name='+encodeURIComponent(name)).then(function(r) {
-      if (!r.ok) { r.json().then(function(j) { toast(j.message,'error'); }); return; }
+      if (!r.ok) {
+        return r.json().then(function(j) {
+          toast((j && j.message) || ('Download failed ('+r.status+')'),'error');
+          return null;
+        }).catch(function() {
+          toast('Download failed ('+r.status+')','error');
+          return null;
+        });
+      }
       return r.text();
     }).then(function(text) {
+      if (text == null) return; // error path already toasted — never download an empty file
       var blob = new Blob([text],{type:'text/yaml'});
       var a = document.createElement('a'); a.href=URL.createObjectURL(blob);
       a.download=name+'_agent.yaml'; a.click(); URL.revokeObjectURL(a.href);
       toast('Downloaded '+name+'_agent.yaml');
-    });
+    }).catch(function(e) { toast('Download failed: '+e.message,'error'); });
   }
 
   // ── Backup/Restore ─────────────────────────────────────

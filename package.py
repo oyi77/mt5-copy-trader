@@ -5,6 +5,29 @@ import os
 import shutil
 
 
+def copy_bundle(src_dir: str, dst_dir: str, exe_name: str) -> None:
+    """Copy a PyInstaller bundle into the staging dir.
+
+    Handles both layouts: onedir (dist/<name>/<name>.exe + _internal/) and
+    onefile (dist/<name>.exe).
+    """
+    exe_path = os.path.join(os.path.dirname(src_dir), f"{exe_name}.exe")
+    if os.path.isdir(src_dir):
+        for item in os.listdir(src_dir):
+            s = os.path.join(src_dir, item)
+            d = os.path.join(dst_dir, item)
+            if os.path.isdir(s):
+                shutil.copytree(s, d, ignore=shutil.ignore_patterns("*.pyc", "__pycache__"))
+            else:
+                shutil.copy2(s, d)
+    elif os.path.isfile(exe_path):
+        shutil.copy2(exe_path, os.path.join(dst_dir, f"{exe_name}.exe"))
+    else:
+        raise FileNotFoundError(
+            f"Build output not found: {src_dir} (onedir folder) or {exe_path} (onefile exe)"
+        )
+
+
 def main():
     root = os.path.dirname(os.path.abspath(__file__))
     os.chdir(root)
@@ -17,27 +40,16 @@ def main():
     os.makedirs(os.path.join(stage, "master"))
     os.makedirs(os.path.join(stage, "follower"))
 
-    # Copy run.exe + its folder contents
-    run_src = "dist/run"
-    run_dst = os.path.join(stage, "master")
-    for item in os.listdir(run_src):
-        s = os.path.join(run_src, item)
-        d = os.path.join(run_dst, item)
-        if os.path.isdir(s):
-            shutil.copytree(s, d, ignore=shutil.ignore_patterns("*.pyc", "__pycache__"))
-        else:
-            shutil.copy2(s, d)
+    # Copy run.exe (onedir folder or onefile exe)
+    copy_bundle("dist/run", os.path.join(stage, "master"), "run")
+    # Copy agent.exe (onedir folder or onefile exe)
+    copy_bundle("dist/agent", os.path.join(stage, "follower"), "agent")
 
-    # Copy agent.exe + its folder contents
-    agent_src = "dist/agent"
-    agent_dst = os.path.join(stage, "follower")
-    for item in os.listdir(agent_src):
-        s = os.path.join(agent_src, item)
-        d = os.path.join(agent_dst, item)
-        if os.path.isdir(s):
-            shutil.copytree(s, d, ignore=shutil.ignore_patterns("*.pyc", "__pycache__"))
-        else:
-            shutil.copy2(s, d)
+    # Ship sample configs — they are NOT baked into the exes (runtime artifacts)
+    if os.path.exists("config.yaml"):
+        shutil.copy2("config.yaml", os.path.join(stage, "master", "config.yaml"))
+    if os.path.exists("agent_config_deploy.yaml"):
+        shutil.copy2("agent_config_deploy.yaml", os.path.join(stage, "follower", "agent_config.yaml"))
 
     # Write README
     with open(os.path.join(stage, "README.txt"), "w") as f:
@@ -51,12 +63,11 @@ FILES:
   follower/agent.exe   -> Run on each follower PC
 
 QUICK START (MASTER):
-  1. Double-click master/run.exe
-  2. On first run, it creates config.yaml - edit it:
+  1. Edit config.yaml (shipped next to run.exe):
      - Set master terminal path & port
      - (Optional) Add same-PC followers
-  3. Restart run.exe
-  4. Open http://localhost:5000 in browser for dashboard
+  2. Double-click master/run.exe
+  3. Open http://localhost:5000 in browser for dashboard
 
 FOLLOWER SETUP:
   1. Install Tailscale on all machines (or use LAN IPs)
@@ -71,7 +82,8 @@ NOTES:
   - MetaTrader 5 must be installed on both machines
   - MT5 Expert Advisors tab must have a unique port set
   - MT5 must be logged in with the trading account
-  - Both exes auto-create default config files on first run
+  - Configs are not baked into the exes: edit the shipped config.yaml /
+    agent_config.yaml before first run (they contain your login credentials)
 """)
 
     # Zip it

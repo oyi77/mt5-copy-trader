@@ -7,11 +7,20 @@ import logging
 import time
 from typing import Any, Optional
 
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+    _MT5_AVAILABLE = True
+except ImportError:
+    # EA-only master mode: the bridge polls TradeSender.mq5's signal file and
+    # never touches MT5 IPC, so the package is optional at import time.
+    mt5 = None
+    _MT5_AVAILABLE = False
 
 from src.config import Config, FollowerConfig
 from src.master import MasterMonitor
+from src.master_ea import MasterSignalFile
 from src.follower import FollowerExecutor
+from src.ea_watchdog import EaWatchdog
 from src.state import SharedState
 
 logger = logging.getLogger(__name__)
@@ -53,12 +62,30 @@ class CopyTradeBridge:
         state: SharedState,
         event_queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
+        event_store=None,
     ):
         self._cfg = config
         self._state = state
         self._queue = event_queue
         self._loop = loop
-        self._master = MasterMonitor(config.master)
+        self._event_store = event_store
+        if config.master.ea_signals_file:
+            self._file_master = True
+            self._master: MasterMonitor | MasterSignalFile = MasterSignalFile(
+                config.master.ea_signals_file
+            )
+            # Optional auto-recovery for the EA-mode master terminal.
+            self._watchdog: Optional[EaWatchdog] = EaWatchdog(
+                config.master.path,
+                attach_script=config.master.ea_watchdog_attach_script,
+                login=config.master.login,
+                password=config.master.password,
+                server=config.master.server,
+            )
+        else:
+            self._file_master = False
+            self._master = MasterMonitor(config.master)
+            self._watchdog = None
         self._running = False
         self._active_followers: dict[str, FollowerExecutor] = {}
         self._activation_results: dict[str, tuple[bool, str]] = {}
@@ -72,7 +99,10 @@ class CopyTradeBridge:
         """Blocking run — call from a thread."""
         logger.info("%s", "=" * 60)
         logger.info("BRIDGE - starting")
-        logger.info("  Master port: %d", self._cfg.master.port)
+        if self._file_master:
+            logger.info("  Master source: EA signal file (%s)", self._cfg.master.ea_signals_file)
+        else:
+            logger.info("  Master port: %d", self._cfg.master.port)
         logger.info("  Poll interval: %d ms", self._cfg.poll_interval_ms)
         logger.info("%s", "=" * 60)
 
@@ -143,6 +173,14 @@ class CopyTradeBridge:
         cfg = next((fc for fc in self._cfg.followers if fc.name == name), None)
         if cfg is None:
             self._activation_results[name] = (False, f"Follower '{name}' not found")
+            return
+
+        if not _MT5_AVAILABLE:
+            self._activation_results[name] = (
+                False,
+                f"MetaTrader5 package not installed — cannot activate '{name}' "
+                "(EA-only master mode has no IPC; use an agent on the follower machine)",
+            )
             return
 
         executor = FollowerExecutor(cfg)
@@ -231,6 +269,10 @@ class CopyTradeBridge:
     def _tick(self) -> None:
         self._state.update_stats(cycles=self._state.stats.cycles + 1)
 
+        if self._file_master:
+            self._tick_file_master()
+            return
+
         # 1. Poll master
         if not self._master.connect():
             self._state.stats.master_connected = False
@@ -258,6 +300,70 @@ class CopyTradeBridge:
             return
 
         # 4. Record + broadcast events (existing — for remote agents)
+        self._broadcast_events(events)
+        time.sleep(0.1)
+
+    def _tick_file_master(self) -> None:
+        """EA-mode cycle: read signal file, relay events, update dashboard."""
+        events = self._master.poll_events()
+        if events is None:
+            # Signal file missing or heartbeat stale — master unreachable.
+            self._state.stats.master_connected = False
+            if self._cfg.master.ea_watchdog and self._watchdog is not None:
+                self._try_recover_ea()
+            time.sleep(1.0)
+            return
+
+        self._state.stats.master_connected = True
+        self._update_master_state([], self._master.last_account())
+
+        if not events:
+            time.sleep(self._cfg.poll_interval_ms / 1000.0)
+            return
+
+        self._broadcast_events(events)
+        time.sleep(0.1)
+
+    def _try_recover_ea(self) -> None:
+        """Run one EA-watchdog recovery cycle; re-broadcast any events that
+        arrived while the terminal was being brought back."""
+        recovered_events: list = []
+
+        def wait_alive(timeout: float) -> bool:
+            alive, collected = self._wait_ea_alive(timeout)
+            recovered_events.extend(collected)
+            return alive
+
+        try:
+            result = self._watchdog.attempt_recovery(wait_alive)
+            logger.warning("EA watchdog: %s", result)
+        except Exception:
+            logger.exception("EA watchdog recovery failed")
+        if recovered_events:
+            logger.info(
+                "EA watchdog: re-broadcasting %d events received during recovery",
+                len(recovered_events),
+            )
+            self._broadcast_events(recovered_events)
+
+    def _wait_ea_alive(self, timeout: float) -> tuple[bool, list]:
+        """Poll the EA signal file until the heartbeat resumes or timeout.
+
+        Returns (alive, events) — trade events emitted during the wait are
+        collected, never dropped (at-least-once delivery).
+        """
+        deadline = time.monotonic() + timeout
+        collected: list = []
+        while time.monotonic() < deadline:
+            events = self._master.poll_events()
+            if events is not None:
+                collected.extend(events)
+                return True, collected
+            time.sleep(1.0)
+        return False, collected
+
+    def _broadcast_events(self, events: list) -> None:
+        """Record events in the store and hand them to the hub + local followers."""
         self._state.update_stats(
             events_detected=self._state.stats.events_detected + len(events),
             last_event_time=time.time(),
@@ -274,13 +380,18 @@ class CopyTradeBridge:
 
         # Put events on the queue for broadcast to remote agents
         dict_events = [_event_to_dict(e) for e in events]
+
+        # Persist to event store (seq_id embedded in each dict)
+        if self._event_store:
+            for de in dict_events:
+                seq_id = self._event_store.append_event(de)
+                de["_seq_id"] = seq_id
+
         self._loop.call_soon_threadsafe(self._queue.put_nowait, dict_events)
 
-        # 5. Execute on active local followers
+        # Execute on active local followers
         if self._active_followers:
             self._execute_on_followers(events)
-
-        time.sleep(0.1)
 
     def _execute_on_followers(self, events: list) -> None:
         """Execute trade events on all active local followers."""
@@ -300,6 +411,11 @@ class CopyTradeBridge:
     # ------------------------------------------------------------------
 
     def _take_snapshot(self) -> None:
+        if self._file_master:
+            logger.info("Taking master EA baseline (skips existing history)...")
+            self._master.snapshot()
+            self._update_master_state([], self._master.last_account())
+            return
         logger.info("Taking master position snapshot...")
         if not self._master.connect():
             logger.error("Cannot take snapshot - master unreachable")

@@ -2,10 +2,153 @@
 
 from __future__ import annotations
 
+import os
+import sqlite3
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
+
+
+class EventStore:
+    """Thread-safe, persistent event log for at-least-once delivery.
+
+    Every trade event detected by the bridge is written to SQLite before
+    broadcast. Agents track their last processed seq_id locally and send
+    it on reconnect — the hub replays all missed events.
+
+    Thread-safe for access from both the bridge thread (writer) and the
+    asyncio hub (reader + writer). Uses WAL mode for concurrent access.
+    """
+
+    # Prune at most every N appends so retention checks stay cheap
+    _PRUNE_INTERVAL = 100
+
+    def __init__(
+        self,
+        db_path: str = "event_store.db",
+        retention_days: int = 7,
+        max_events: int = 100000,
+    ):
+        self._db_path = db_path
+        self._retention_days = retention_days
+        self._max_events = max_events
+        self._local = threading.local()
+        self._columns: list[str] = []
+        self._appends_since_prune = 0
+        self._init_db()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get thread-local connection."""
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            self._local.conn = sqlite3.connect(self._db_path)
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+        return self._local.conn
+
+    def _init_db(self) -> None:
+        conn = self._get_conn()
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                symbol TEXT NOT NULL DEFAULT '',
+                volume REAL NOT NULL DEFAULT 0.0,
+                price REAL NOT NULL DEFAULT 0.0,
+                sl REAL,
+                tp REAL,
+                master_ticket INTEGER NOT NULL DEFAULT 0,
+                position_type INTEGER NOT NULL DEFAULT 0,
+                comment TEXT NOT NULL DEFAULT '',
+                magic INTEGER NOT NULL DEFAULT 0,
+                prev_volume REAL,
+                order_type INTEGER,
+                expiration INTEGER,
+                created_at REAL NOT NULL
+            );
+        """)
+        conn.commit()
+        # Cache column names once; the events schema is fixed after creation
+        self._columns = [d[1] for d in conn.execute("PRAGMA table_info(events)").fetchall()]
+        self._maybe_prune()
+
+    def _maybe_prune(self) -> None:
+        """Delete events outside retention limits. Runs only on the write path."""
+        conn = self._get_conn()
+        if self._retention_days > 0:
+            cutoff = time.time() - self._retention_days * 86400.0
+            conn.execute("DELETE FROM events WHERE created_at < ?", (cutoff,))
+        if self._max_events > 0:
+            # Keep only the newest max_events rows (no-op while the table is
+            # below the cap: the OFFSET subquery yields NULL and id <= NULL
+            # matches nothing)
+            conn.execute(
+                """DELETE FROM events WHERE id <= (
+                       SELECT id FROM events ORDER BY id DESC LIMIT 1 OFFSET ?
+                   )""",
+                (self._max_events,),
+            )
+        conn.commit()
+
+    def append_event(self, event_dict: dict) -> int:
+        """Persist a trade event and return its auto-increment seq_id."""
+        conn = self._get_conn()
+        now = time.time()
+        conn.execute(
+            """INSERT INTO events
+               (action, symbol, volume, price, sl, tp, master_ticket,
+                position_type, comment, magic, prev_volume, order_type,
+                expiration, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event_dict.get("action", ""),
+                event_dict.get("symbol", ""),
+                event_dict.get("volume", 0.0),
+                event_dict.get("price", 0.0),
+                event_dict.get("sl"),
+                event_dict.get("tp"),
+                event_dict.get("master_ticket", 0),
+                event_dict.get("position_type", 0),
+                event_dict.get("comment", ""),
+                event_dict.get("magic", 0),
+                event_dict.get("prev_volume"),
+                event_dict.get("order_type"),
+                event_dict.get("expiration"),
+                now,
+            ),
+        )
+        conn.commit()
+        seq_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self._appends_since_prune += 1
+        if self._appends_since_prune >= self._PRUNE_INTERVAL:
+            self._appends_since_prune = 0
+            self._maybe_prune()
+        return seq_id
+
+    def get_events_since(self, seq_id: int) -> list[dict]:
+        """Return all events with id > seq_id, oldest first."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM events WHERE id > ? ORDER BY id ASC", (seq_id,),
+        ).fetchall()
+        columns = self._columns
+        result = [dict(zip(columns, row)) for row in rows]
+        # Rename 'id' to '_seq_id' so downstream code sees a consistent field name
+        for d in result:
+            if "id" in d:
+                d["_seq_id"] = d.pop("id")
+        return result
+
+    def get_last_seq(self) -> int:
+        """Return the max seq_id (0 if empty)."""
+        conn = self._get_conn()
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()
+        return row[0] if row else 0
+
+    def close(self) -> None:
+        """Close thread-local connection."""
+        if hasattr(self._local, "conn") and self._local.conn is not None:
+            self._local.conn.close()
+            self._local.conn = None
 
 
 class EquityHistory:
@@ -75,6 +218,9 @@ class AgentInfo:
     account_name: str = ""
     account_login: int = 0
 
+    # Auto-trading state (from terminal_info)
+    trade_allowed: bool = False
+
     # PnL
     unrealized_pnl: float = 0.0
     daily_pnl: float = 0.0
@@ -90,6 +236,9 @@ class AgentInfo:
     events_copied: int = 0
     errors: int = 0
     ping_history: list[float] = field(default_factory=list)
+
+    # Deployment state
+    state: str = "unconfigured"  # unconfigured | deploying | trading | error
 
     # Remote config overrides (pushed from dashboard)
     config_overrides: dict = field(default_factory=dict)
@@ -119,6 +268,7 @@ class AgentInfo:
             "server": self.server,
             "account_name": self.account_name,
             "account_login": self.account_login,
+            "trade_allowed": self.trade_allowed,
             "unrealized_pnl": self.unrealized_pnl,
             "daily_pnl": self.daily_pnl,
             "total_pnl": self.total_pnl,
@@ -128,6 +278,8 @@ class AgentInfo:
             "last_event_time": self.last_event_time,
             "events_copied": self.events_copied,
             "errors": self.errors,
+            "ping_history": list(self.ping_history),
+            "state": self.state,
             "config_overrides": dict(self.config_overrides),
         }
 
@@ -152,10 +304,22 @@ class SharedState:
         self.master_account: dict = {}
         self.agents: dict[str, AgentInfo] = {}
         self.stats = BridgeStats()
-        self.known_tickets: set[int] = set()
+        self._known_tickets: set[int] = set()
         self.equity_history = EquityHistory()
         self.activity = ActivityLog()
         self.follower_states: dict[str, dict] = {}
+
+    @property
+    def known_tickets(self) -> set[int]:
+        """Master tickets already copied. The setter replaces the whole set
+        under the lock so bridge writes (bridge.py) stay consistent with
+        locked reads. Callers must not mutate the returned set."""
+        return self._known_tickets
+
+    @known_tickets.setter
+    def known_tickets(self, value: set[int]) -> None:
+        with self._lock:
+            self._known_tickets = set(value)
 
     # ── Master ────────────────────────────────────────────────
 
@@ -276,6 +440,7 @@ class SharedState:
             info.leverage = data.get("leverage", info.leverage)
             info.currency = data.get("currency", info.currency)
             info.server = data.get("server", info.server)
+            info.trade_allowed = data.get("trade_allowed", info.trade_allowed)
             info.account_name = data.get("account_name", info.account_name)
             info.account_login = data.get("account_login", info.account_login)
             info.unrealized_pnl = data.get("unrealized_pnl", info.unrealized_pnl)
@@ -283,6 +448,7 @@ class SharedState:
             info.total_pnl = data.get("total_pnl", info.total_pnl)
             info.positions = data.get("positions", info.positions)
             info.position_count = data.get("position_count", len(info.positions))
+            info.state = data.get("state", info.state)
             # Also update identity fields if present
             for f in ("agent_id", "version", "hostname", "platform"):
                 val = data.get(f)
@@ -316,8 +482,16 @@ class SharedState:
                 info.ping_history = info.ping_history[-60:]
 
     def get_agents(self) -> dict[str, AgentInfo]:
+        """Return a snapshot of all agents; callers may safely mutate the copies."""
         with self._lock:
-            return {k: v for k, v in self.agents.items()}
+            result = {}
+            for k, v in self.agents.items():
+                copy = replace(v)
+                copy.positions = list(v.positions)
+                copy.config_overrides = dict(v.config_overrides)
+                copy.ping_history = list(v.ping_history)
+                result[k] = copy
+            return result
 
     def get_connected_agent_names(self) -> list[str]:
         with self._lock:

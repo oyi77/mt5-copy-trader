@@ -38,6 +38,10 @@ class Position:
             magic=pos.magic,
         )
 
+    def __str__(self) -> str:
+        return (f"Position(ticket={self.ticket}, symbol={self.symbol}, "
+                f"volume={self.volume}, profit={self.profit}, type={self.type})")
+
 
 @dataclass
 class PendingOrder:
@@ -68,6 +72,10 @@ class PendingOrder:
             expiration=getattr(order, 'expiration', 0),
         )
 
+    def __str__(self) -> str:
+        return (f"PendingOrder(ticket={self.ticket}, symbol={self.symbol}, "
+                f"volume={self.volume}, price={self.price}, type={self.type})")
+
 
 @dataclass
 class TradeEvent:
@@ -91,6 +99,10 @@ class TradeEvent:
         if self.prev_volume is not None and self.volume < self.prev_volume:
             return round(self.prev_volume - self.volume, 2)
         return None
+
+    def __str__(self) -> str:
+        return (f"TradeEvent(action={self.action}, symbol={self.symbol}, "
+                f"volume={self.volume}, ticket={self.master_ticket})")
 
 
 # Magic number range reserved for this bridge

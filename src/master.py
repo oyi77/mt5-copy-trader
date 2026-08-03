@@ -6,7 +6,15 @@ import logging
 import time
 from typing import Optional
 
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+    _MT5_AVAILABLE = True
+except ImportError:
+    # EA-only master mode: the bridge tails TradeSender.mq5's signal file and
+    # never touches MT5 IPC, so the package is optional at import time. The
+    # IPC methods below fail closed (return False / []) when it is absent.
+    mt5 = None
+    _MT5_AVAILABLE = False
 
 from src.config import MasterConfig
 from src.models import Position, PendingOrder, TradeEvent
@@ -30,12 +38,20 @@ class MasterMonitor:
 
     def connect(self) -> bool:
         """Connect to master terminal."""
+        if not _MT5_AVAILABLE:
+            logger.error(
+                "Master connect failed: MetaTrader5 package not installed — "
+                "use master.ea_signals_file (EA mode) instead of IPC"
+            )
+            return False
         result = mt5.initialize(path=self._cfg.path, port=self._cfg.port)
         if not result:
             logger.error("Master connect failed: %s", mt5.last_error())
         return result
 
     def disconnect(self) -> None:
+        if not _MT5_AVAILABLE:
+            return
         mt5.shutdown()
 
     def poll(self) -> list[Position]:

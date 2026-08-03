@@ -19,7 +19,7 @@ import sys
 SEP = ";" if sys.platform == "win32" else ":"
 
 
-def build_exe(name: str, entry: str) -> None:
+def build_exe(name: str, entry: str, console: bool = True) -> None:
     """Build one exe with PyInstaller."""
     print(f"\n{'='*60}")
     print(f"  Building {name}.exe from {entry}")
@@ -29,7 +29,7 @@ def build_exe(name: str, entry: str) -> None:
         sys.executable, "-m", "PyInstaller",
         "--name", name,
         "--noconfirm",
-        "--console",
+        "--console" if console else "--noconsole",
     ]
 
     # onefile or onedir
@@ -41,12 +41,22 @@ def build_exe(name: str, entry: str) -> None:
     # Bundle static files (only needed by run.exe, harmless for agent)
     cmd.extend(["--add-data", f"static{SEP}static"])
 
-    # Bundle default configs so we can auto-extract on first run
-    cmd.extend(["--add-data", f"config.yaml{SEP}."])
-    cmd.extend(["--add-data", f"agent_config.yaml{SEP}."])
+    # Runtime artifacts (config.yaml, logs/, event_store.db*, scratch/) are NOT
+    # bundled: configs contain live credentials and must ship next to the exe.
+
+    # src/ package — force explicit inclusion of every module (imports are
+    # static today, this guards against future dynamic-import regressions)
+    for mod in [
+        "src.config", "src.models", "src.state", "src.bridge",
+        "src.master", "src.follower", "src.server", "src.agent_client",
+    ]:
+        cmd.extend(["--hidden-import", mod])
 
     # MetaTrader5 — native .pyd, force explicit inclusion
     cmd.extend(["--hidden-import", "MetaTrader5"])
+
+    # psutil — used for process discovery in auto-trading enabler
+    cmd.extend(["--hidden-import", "psutil"])
 
     # aiohttp deps sometimes missed
     cmd.extend(["--hidden-import", "multidict._multidict_py"])
@@ -70,7 +80,7 @@ def build_exe(name: str, entry: str) -> None:
 
     print(f"  $ {' '.join(cmd)}")
     subprocess.check_call(cmd)
-    print(f"  ✓ {name}.exe built")
+    print(f"  [OK] {name}.exe built")
 
 
 def main():
@@ -86,8 +96,8 @@ def main():
     os.makedirs("dist", exist_ok=True)
 
     # Build both
-    build_exe("run", "run.py")
-    build_exe("agent", "agent.py")
+    build_exe("run", "run.py", console=True)
+    build_exe("agent", "agent.py", console=False)
 
     # Summary
     print(f"\n{'='*60}")
@@ -106,8 +116,8 @@ def main():
             print(f"  ? {path} not found")
     print()
     print("  To deploy:")
-    print("    dist/run.exe   → master machine with MT5")
-    print("    dist/agent.exe → each follower machine")
+    print("    dist/run.exe   -> master machine with MT5")
+    print("    dist/agent.exe -> each follower machine")
     print()
 
 
