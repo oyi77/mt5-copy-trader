@@ -90,6 +90,10 @@ class CopyTradeBridge:
         self._active_followers: dict[str, FollowerExecutor] = {}
         self._activation_results: dict[str, tuple[bool, str]] = {}
         self._activation_pending: list[str] = []
+        # Cached master account info: IPC mode polls it at most once per second
+        # instead of once per tick (another pipe round trip per cycle).
+        self._last_account = None
+        self._last_account_ts = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -125,6 +129,7 @@ class CopyTradeBridge:
 
         self._log_shutdown()
         self._deactivate_all()
+        self._master.disconnect()
 
     def stop(self) -> None:
         self._running = False
@@ -273,18 +278,17 @@ class CopyTradeBridge:
             self._tick_file_master()
             return
 
-        # 1. Poll master
-        if not self._master.connect():
+        # 1. Poll master (persistent IPC connection — re-initializes only
+        #    after the terminal went away, not every cycle). Polls handle
+        #    their own connection-failure detection and mark it for reconnect.
+        if not self._master.ensure_connected():
             self._state.stats.master_connected = False
             time.sleep(1.0)
             return
 
-        try:
-            positions = self._master.poll()
-            orders = self._master.poll_orders()
-            account = self._get_account_info()
-        finally:
-            self._master.disconnect()
+        positions = self._master.poll()
+        orders = self._master.poll_orders()
+        account = self._get_account_info()
 
         self._state.stats.master_connected = True
 
@@ -417,7 +421,7 @@ class CopyTradeBridge:
             self._update_master_state([], self._master.last_account())
             return
         logger.info("Taking master position snapshot...")
-        if not self._master.connect():
+        if not self._master.ensure_connected():
             logger.error("Cannot take snapshot - master unreachable")
             return
         try:
@@ -427,8 +431,8 @@ class CopyTradeBridge:
             account = self._get_account_info()
             self._update_master_state(positions, account)
             logger.info("Master snapshot: %d positions, %d pending orders", len(positions), len(orders))
-        finally:
-            self._master.disconnect()
+        except RuntimeError as e:
+            logger.error("Snapshot failed: %s", e)
 
     def _update_master_state(self, positions, account) -> None:
         pos_list = []
@@ -462,11 +466,24 @@ class CopyTradeBridge:
             }
         self._state.update_master(pos_list, acc_info)
 
+    _ACCOUNT_POLL_INTERVAL = 1.0
+
     def _get_account_info(self):
+        """Master account info, polled at most once per second.
+
+        ``mt5.account_info()`` is another IPC round trip per call; equity and
+        balance only need second-level freshness (the dashboard SSE frame is
+        the consumer), so skip the pipe when the cache is fresh.
+        """
+        now = time.monotonic()
+        if now - self._last_account_ts < self._ACCOUNT_POLL_INTERVAL:
+            return self._last_account
+        self._last_account_ts = now
         try:
-            return mt5.account_info()
-        except Exception:
-            return None
+            self._last_account = mt5.account_info()
+        except RuntimeError:
+            self._last_account = None
+        return self._last_account
 
     def _log_shutdown(self) -> None:
         stats = self._state.get_stats()

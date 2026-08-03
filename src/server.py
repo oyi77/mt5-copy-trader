@@ -380,8 +380,58 @@ async def handle_api_status(request: web.Request) -> web.Response:
     })
 
 
+class _SseFanout:
+    """Shared dashboard snapshot broadcaster.
+
+    Computes one snapshot and one JSON payload per tick and fans it out to
+    every SSE client — instead of each client re-snapshotting and
+    re-serializing, which multiplied the cost with every open dashboard tab.
+    Each client keeps a maxsize-1 queue holding the latest frame, so a slow
+    reader skips stale frames but always catches the newest state.
+    """
+
+    _TICK = 2.0  # matches the previous per-client SSE interval
+
+    def __init__(self, state: SharedState):
+        self._state = state
+        self._clients: set[asyncio.Queue] = set()
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=1)
+        self._clients.add(q)
+        return q
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        self._clients.discard(queue)
+
+    def latest_frame(self) -> str:
+        """Build the current SSE payload (used for the first frame)."""
+        snap = self._state.snapshot()
+        rows = _get_agent_order(self._state, snap)
+        return json.dumps({
+            "accounts": rows,
+            "portfolio": snap["portfolio"],
+            "stats": snap["stats"],
+            "t": time.time(),
+        })
+
+    async def run(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self._TICK)
+                payload = self.latest_frame()
+                for queue in list(self._clients):
+                    if queue.full():
+                        queue.get_nowait()  # drop stale frame, keep newest
+                    queue.put_nowait(payload)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("SSE broadcast error")
+
+
 async def handle_api_stream(request: web.Request) -> web.StreamResponse:
-    state: SharedState = request.app["state"]
+    sse: _SseFanout = request.app["sse"]
     response = web.StreamResponse(
         status=200, reason="OK",
         headers={
@@ -394,22 +444,20 @@ async def handle_api_stream(request: web.Request) -> web.StreamResponse:
         },
     )
     await response.prepare(request)
+    queue = sse.subscribe()
     try:
         # SSE retry hint (comment-style line): reconnect after 3 seconds.
         await response.write(b"retry: 3000\n\n")
+        # First frame immediately, so the dashboard renders without waiting
+        # for the next shared tick.
+        await response.write(f"data: {sse.latest_frame()}\n\n".encode())
         while True:
-            snap = state.snapshot()
-            rows = _get_agent_order(state, snap)
-            payload = json.dumps({
-                "accounts": rows,
-                "portfolio": snap["portfolio"],
-                "stats": snap["stats"],
-                "t": time.time(),
-            })
+            payload = await queue.get()
             await response.write(f"data: {payload}\n\n".encode())
-            await asyncio.sleep(2)
     except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
         pass
+    finally:
+        sse.unsubscribe(queue)
     return response
 
 
@@ -862,6 +910,9 @@ def create_app(
     hub = AgentHub(state, event_queue, event_store=event_store)
     app["hub"] = hub
 
+    sse = _SseFanout(state)
+    app["sse"] = sse
+
     # Dashboard
     app.router.add_get("/favicon.ico", handle_favicon)
     app.router.add_get("/", handle_index)
@@ -924,8 +975,15 @@ def create_app(
     async def _on_startup(app):
         hub.start()
         asyncio.create_task(_record_equity(app))
+        app["sse_task"] = asyncio.create_task(app["sse"].run())
+
+    async def _on_shutdown(app):
+        task = app.get("sse_task")
+        if task is not None:
+            task.cancel()
+        hub.stop()
 
     app.on_startup.append(_on_startup)
-    app.on_shutdown.append(lambda _: hub.stop())
+    app.on_shutdown.append(_on_shutdown)
 
     return app

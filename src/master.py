@@ -31,42 +31,81 @@ class MasterMonitor:
         self._known_tickets: set[int] = set()      # tickets we've copied
         self._order_snapshot: dict[int, PendingOrder] = {}
         self._known_order_tickets: set[int] = set()
+        self._connected = False
 
     @property
     def known_tickets(self) -> set[int]:
         return self._known_tickets
 
+    def ensure_connected(self) -> bool:
+        """Make sure the IPC connection to the master terminal is alive.
+
+        ``mt5.initialize()`` / ``mt5.shutdown()`` spawn and tear down the
+        terminal pipe handshake, so doing it every poll cycle dominated the
+        bridge loop. This keeps the connection open across cycles and only
+        re-initializes after a poll detected the terminal went away (see
+        ``_mark_disconnected``).
+        """
+        if self._connected:
+            return True
+        return self.connect()
+
     def connect(self) -> bool:
-        """Connect to master terminal."""
+        """(Re)initialize the connection to master terminal."""
         if not _MT5_AVAILABLE:
             logger.error(
                 "Master connect failed: MetaTrader5 package not installed — "
                 "use master.ea_signals_file (EA mode) instead of IPC"
             )
             return False
-        result = mt5.initialize(path=self._cfg.path, port=self._cfg.port)
+        try:
+            result = mt5.initialize(path=self._cfg.path, port=self._cfg.port)
+        except RuntimeError as e:
+            logger.error("Master connect failed: %s", e)
+            result = False
+        self._connected = bool(result)
         if not result:
             logger.error("Master connect failed: %s", mt5.last_error())
-        return result
+        return self._connected
+
+    def _mark_disconnected(self) -> None:
+        """Note that the IPC connection died; next tick re-initializes."""
+        self._connected = False
 
     def disconnect(self) -> None:
         if not _MT5_AVAILABLE:
             return
-        mt5.shutdown()
+        try:
+            mt5.shutdown()
+        except RuntimeError:
+            pass
+        self._connected = False
 
     def poll(self) -> list[Position]:
         """Fetch all open positions from master. Returns empty list on error."""
-        positions = mt5.positions_get()
+        try:
+            positions = mt5.positions_get()
+        except RuntimeError as e:
+            logger.warning("Master positions_get raised: %s", e)
+            self._mark_disconnected()
+            return []
         if positions is None:
             logger.warning("Master positions_get returned None: %s", mt5.last_error())
+            self._mark_disconnected()
             return []
         return [Position.from_mt5(p) for p in positions]
 
     def poll_orders(self) -> list[PendingOrder]:
         """Fetch all pending orders from master. Returns empty list on error."""
-        orders = mt5.orders_get()
+        try:
+            orders = mt5.orders_get()
+        except RuntimeError as e:
+            logger.warning("Master orders_get raised: %s", e)
+            self._mark_disconnected()
+            return []
         if orders is None:
             logger.warning("Master orders_get returned None: %s", mt5.last_error())
+            self._mark_disconnected()
             return []
         return [PendingOrder.from_mt5(o) for o in orders]
 
@@ -226,17 +265,18 @@ class MasterMonitor:
         return events
 
     def run_once(self) -> list[TradeEvent]:
-        """Full poll-detect cycle. Returns events to execute."""
-        if not self.connect():
+        """Full poll-detect cycle. Returns events to execute.
+
+        Uses the persistent connection — a dead terminal is detected by the
+        polls and re-initialized on the next cycle.
+        """
+        if not self.ensure_connected():
             logger.warning("Skipping master poll cycle — connection failed")
             time.sleep(1.0)
             return []
 
-        try:
-            positions = self.poll()
-            orders = self.poll_orders()
-            events = self.detect_changes(positions)
-            events += self.detect_order_changes(orders)
-            return events
-        finally:
-            self.disconnect()
+        positions = self.poll()
+        orders = self.poll_orders()
+        events = self.detect_changes(positions)
+        events += self.detect_order_changes(orders)
+        return events

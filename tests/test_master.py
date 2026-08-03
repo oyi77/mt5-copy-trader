@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from helpers import install_mt5_mock
+from helpers import fake_mt5_position, install_mt5_mock
 
 install_mt5_mock()  # master.py imports MetaTrader5 at module level
 
@@ -164,6 +164,67 @@ class DetectOrderChangesTest(unittest.TestCase):
         mon.snapshot([], [_order()])
         self.assertEqual(mon.detect_order_changes([_order()]), [])
         self.assertEqual(mon.detect_order_changes([]), [])
+
+
+class ConnectionLifecycleTest(unittest.TestCase):
+    """The bridge keeps the MT5 IPC connection alive across poll cycles.
+
+    ``ensure_connected()`` must initialize once and reuse, and any poll that
+    sees a dead terminal must mark the connection for re-initialization on the
+    next cycle — never tear down and re-attach per tick.
+    """
+
+    def setUp(self):
+        self.mt5 = install_mt5_mock()
+        # reset_mock() alone keeps return_value/side_effect since py3.8 —
+        # clear both so no test leaks config into the next.
+        self.mt5.reset_mock(return_value=True, side_effect=True)
+        self.mt5.initialize.return_value = True
+        self.mon = _monitor()
+
+    def test_ensure_connected_initializes_once_and_reuses(self):
+        self.assertTrue(self.mon.ensure_connected())
+        self.assertTrue(self.mon.ensure_connected())
+        self.assertEqual(self.mt5.initialize.call_count, 1)
+
+    def test_poll_failure_marks_disconnected_and_reconnects(self):
+        self.mt5.positions_get.return_value = None
+        self.assertTrue(self.mon.ensure_connected())
+        self.assertEqual(self.mon.poll(), [])
+        # Dead connection detected → next cycle re-initializes.
+        self.assertTrue(self.mon.ensure_connected())
+        self.assertEqual(self.mt5.initialize.call_count, 2)
+
+    def test_connect_failure_returns_false(self):
+        self.mt5.initialize.return_value = False
+        self.assertFalse(self.mon.ensure_connected())
+
+    def test_initialize_runtime_error_fails_closed(self):
+        self.mt5.initialize.side_effect = RuntimeError("terminal not found")
+        self.assertFalse(self.mon.ensure_connected())
+
+    def test_poll_runtime_error_returns_empty_and_reconnects(self):
+        self.mt5.positions_get.side_effect = RuntimeError("not initialized")
+        self.assertTrue(self.mon.ensure_connected())
+        self.assertEqual(self.mon.poll(), [])
+        self.mt5.positions_get.side_effect = None
+        self.assertTrue(self.mon.ensure_connected())
+        self.assertEqual(self.mt5.initialize.call_count, 2)
+
+    def test_disconnect_clears_connection_state(self):
+        self.assertTrue(self.mon.ensure_connected())
+        self.mon.disconnect()
+        self.assertTrue(self.mon.ensure_connected())
+        self.assertEqual(self.mt5.initialize.call_count, 2)
+
+    def test_run_once_detects_open_without_disconnecting(self):
+        self.mt5.positions_get.return_value = [fake_mt5_position()]
+        self.mt5.orders_get.return_value = []
+        events = self.mon.run_once()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].action, "open")
+        # Connection stays alive for the next cycle.
+        self.mt5.shutdown.assert_not_called()
 
 
 if __name__ == "__main__":
