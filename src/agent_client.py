@@ -20,57 +20,13 @@ from typing import Optional
 
 import aiohttp
 
+from src import config_push
 from src.follower import FollowerExecutor
 from src.config import FollowerConfig
 
 logger = logging.getLogger(__name__)
 
 AGENT_VERSION = "1.0.0"
-
-
-def _parse_bool(value, default: bool = False) -> bool:
-    """Parse a boolean, accepting true/false/yes/no/1/0.
-
-    JSON payloads often carry booleans as strings ('false', '1'), which
-    Python's bool() would wrongly treat as True.
-    """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        s = value.strip().lower()
-        if s in ("true", "yes", "1"):
-            return True
-        if s in ("false", "no", "0"):
-            return False
-    return default
-
-
-def _parse_int(value, name: str, minv: Optional[int] = None, maxv: Optional[int] = None) -> int:
-    """Parse an int, raising ValueError with the field name on bad input."""
-    try:
-        v = int(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name}: invalid integer value {value!r}")
-    if minv is not None and v < minv:
-        raise ValueError(f"{name}: {v} below minimum {minv}")
-    if maxv is not None and v > maxv:
-        raise ValueError(f"{name}: {v} above maximum {maxv}")
-    return v
-
-
-def _parse_float(value, name: str, minv: Optional[float] = None, maxv: Optional[float] = None) -> float:
-    """Parse a float, raising ValueError with the field name on bad input."""
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name}: invalid numeric value {value!r}")
-    if minv is not None and v < minv:
-        raise ValueError(f"{name}: {v} below minimum {minv}")
-    if maxv is not None and v > maxv:
-        raise ValueError(f"{name}: {v} above maximum {maxv}")
-    return v
 
 
 class AgentClient:
@@ -337,96 +293,17 @@ class AgentClient:
     async def _handle_config_update(self, config: dict) -> None:
         """Apply config overrides pushed from the hub/dashboard.
 
-        Invalid values are rejected per-field (logged and reported in the ack)
-        instead of raising and killing the WS connection.
+        Per-field validation lives in src/config_push.apply_updates; invalid
+        values are rejected there (logged and reported in the ack) instead of
+        raising and killing the WS connection.
         """
         if not config:
             return
 
-        errors: list[str] = []
-        changed: list[str] = []
-        cfg = self._follower_cfg
-
-        def _field_float(key: str, minv: Optional[float] = None) -> Optional[float]:
-            if key not in config:
-                return None
-            try:
-                return _parse_float(config[key], key, minv=minv)
-            except ValueError as e:
-                errors.append(str(e))
-                return None
-
-        def _field_int(key: str, minv: Optional[int] = None) -> Optional[int]:
-            if key not in config:
-                return None
-            try:
-                return _parse_int(config[key], key, minv=minv)
-            except ValueError as e:
-                errors.append(str(e))
-                return None
-
-        v = _field_float("lot_multiplier", minv=0.0)
-        if v is not None:
-            old = cfg.lot_multiplier
-            cfg.lot_multiplier = v
-            changed.append(f"lot_multiplier: {old} → {cfg.lot_multiplier}")
-
-        v = _field_float("max_lot", minv=0.0)
-        if v is not None:
-            old = cfg.max_lot
-            cfg.max_lot = v
-            changed.append(f"max_lot: {old} → {cfg.max_lot}")
-
-        v = _field_float("min_lot", minv=0.0)
-        if v is not None:
-            old = cfg.min_lot
-            cfg.min_lot = v
-            changed.append(f"min_lot: {old} → {cfg.min_lot}")
-
-        v = _field_int("max_positions", minv=0)
-        if v is not None:
-            old = cfg.max_positions
-            cfg.max_positions = v
-            changed.append(f"max_positions: {old} → {cfg.max_positions}")
-
-        v = _field_int("deviation", minv=0)
-        if v is not None:
-            old = cfg.deviation
-            cfg.deviation = v
-            changed.append(f"deviation: {old} → {cfg.deviation}")
-
-        v = _field_int("magic", minv=0)
-        if v is not None:
-            old = cfg.magic
-            cfg.magic = v
-            changed.append(f"magic: {old} → {cfg.magic}")
-
-        if "queue_path" in config:
-            old = cfg.queue_path
-            new_qp = config["queue_path"]
-            if not isinstance(new_qp, str) or not new_qp.strip():
-                errors.append(f"queue_path: invalid value {new_qp!r}")
-            else:
-                cfg.queue_path = new_qp
-                changed.append(f"queue_path: {old} → {cfg.queue_path}")
-                # Seq file follows the queue location
-                self._seq_path = self._event_store_path or (cfg.queue_path + ".seq")
-
-        if "symbol_mapping" in config:
-            if isinstance(config["symbol_mapping"], dict):
-                cfg.symbol_mapping = {k.upper(): v for k, v in config["symbol_mapping"].items()}
-                changed.append(f"symbol_mapping: {len(cfg.symbol_mapping)} entries")
-            else:
-                errors.append(
-                    f"symbol_mapping: expected an object, got {type(config['symbol_mapping']).__name__}"
-                )
-
-        if errors:
-            logger.warning("Config update rejected field(s): %s", "; ".join(errors))
-        if changed:
-            logger.info("Config updated from hub: %s", "; ".join(changed))
-        else:
-            logger.info("Config update received (no applicable fields): %s", config)
+        result = config_push.apply_updates(self._follower_cfg, config)
+        if result.queue_path is not None:
+            # Seq file follows the queue location
+            self._seq_path = self._event_store_path or (result.queue_path + ".seq")
 
         # Reconnect executor with new config
         self._executor = FollowerExecutor(self._follower_cfg)
@@ -435,9 +312,9 @@ class AgentClient:
         try:
             await self._ws.send_str(json.dumps({
                 "type": "config_ack",
-                "applied": bool(changed),
-                "ok": not errors,
-                "error": "; ".join(errors) if errors else None,
+                "applied": bool(result.changed),
+                "ok": not result.errors,
+                "error": "; ".join(result.errors) if result.errors else None,
                 "config": config,
             }))
         except Exception:
@@ -448,7 +325,11 @@ class AgentClient:
     # ------------------------------------------------------------------
 
     async def _handle_config_deploy(self, config: dict) -> None:
-        """Receive full agent config from dashboard, deploy MT5, start trading."""
+        """Receive full agent config from dashboard, deploy MT5, start trading.
+
+        Validation and schema conversion live in src/config_push; this
+        handler only orchestrates the persistence + activation side effects.
+        """
         import yaml
 
         if self._configured:
@@ -458,70 +339,26 @@ class AgentClient:
         config_path = self._config_save_path
         logger.info("Received deploy config, saving to %s", config_path)
 
-        # Resolve queue path to an absolute location next to the saved config
-        # (survives scheduled-task/SSH cwd differences)
-        queue_path = config.get("queue_path", "trade_queue.json")
-        if not os.path.isabs(queue_path):
-            queue_path = os.path.join(os.path.dirname(config_path), queue_path)
-
         # Validate numeric values before touching anything on disk
         try:
-            port = _parse_int(config.get("port", 0), "port", minv=0, maxv=65535)
-            login = _parse_int(config.get("login", 0), "login", minv=0)
-            lot_multiplier = _parse_float(config.get("lot_multiplier", 1.0), "lot_multiplier", minv=0.0)
-            max_lot = _parse_float(config.get("max_lot", 10.0), "max_lot", minv=0.0)
-            min_lot = _parse_float(config.get("min_lot", 0.01), "min_lot", minv=0.0)
-            max_positions = _parse_int(config.get("max_positions", 10), "max_positions", minv=0)
-            deviation = _parse_int(config.get("deviation", 50), "deviation", minv=0)
-            magic = _parse_int(config.get("magic", 951001), "magic", minv=0)
-            max_daily_loss = _parse_float(config.get("max_daily_loss", 0.0), "max_daily_loss", minv=0.0)
-            max_drawdown_pct = _parse_float(config.get("max_drawdown_pct", 0.0), "max_drawdown_pct", minv=0.0)
-            max_daily_trades = _parse_int(config.get("max_daily_trades", 0), "max_daily_trades", minv=0)
+            values = config_push.parse_deploy_config(config, config_path)
         except ValueError as e:
             logger.warning("Rejecting deploy config: %s", e)
             await self._send_status_update("error", f"Invalid deploy config: {e}")
             return
 
-        raw_mapping = config.get("symbol_mapping", {})
-        if not isinstance(raw_mapping, dict):
-            logger.warning("Deploy config: symbol_mapping ignored (not an object)")
-            raw_mapping = {}
-        symbol_mapping = {k.upper(): v for k, v in raw_mapping.items()}
-
         # Save config in AgentConfig schema (mt5_login/mt5_path/...) so that
         # load_agent_config() succeeds on restart. The dashboard payload uses
-        # FollowerConfig keys (login/path/port/...) — convert here.
+        # FollowerConfig keys (login/path/port/...) — converted here.
         # hub_url is taken from the connection the agent is actually using
         # (e.g. the reverse-tunnel URL), and log_file is forced into the
         # user-writable data dir (filtered scheduled-task tokens can't write
         # relative paths like C:\logs\agent.log).
         data_dir = os.path.dirname(config_path)
-        agent_config = {
-            "name": config.get("name", self._agent_name),
-            "hub_url": self._hub_url,
-            "mt5_path": config.get("path", "C:/Program Files/MetaTrader 5/terminal64.exe"),
-            "mt5_port": port,
-            "mt5_login": login,
-            "mt5_password": config.get("password", ""),
-            "mt5_server": config.get("server", ""),
-            "lot_multiplier": lot_multiplier,
-            "max_lot": max_lot,
-            "min_lot": min_lot,
-            "max_positions": max_positions,
-            "deviation": deviation,
-            "magic": magic,
-            "skip_own_magic": _parse_bool(config.get("skip_own_magic", True), True),
-            "symbol_mapping": symbol_mapping,
-            "skip_auto_trading": _parse_bool(config.get("skip_auto_trading", True), True),
-            "dry_run": _parse_bool(config.get("dry_run", False), False),
-            "terminal_data_path": config.get("terminal_data_path", ""),
-            "max_daily_loss": max_daily_loss,
-            "max_drawdown_pct": max_drawdown_pct,
-            "max_daily_trades": max_daily_trades,
-            "queue_path": queue_path,
-            "log_file": os.path.join(data_dir, "logs", "agent.log"),
-            "log_level": "INFO",
-        }
+        agent_config = config_push.build_agent_config_dict(
+            config, values,
+            agent_name=self._agent_name, hub_url=self._hub_url, data_dir=data_dir,
+        )
 
         if config.get("password"):
             logger.warning(
@@ -534,7 +371,7 @@ class AgentClient:
             yaml.dump(agent_config, f, default_flow_style=False, sort_keys=False)
 
         # Install MT5 if needed
-        if _parse_bool(config.get("install_mt5", True), True):
+        if config_push.parse_bool(config.get("install_mt5", True), True):
             mt5_path = config.get("path", "")
             if not os.path.exists(mt5_path):
                 logger.info("MT5 not found at %s, installing...", mt5_path)
@@ -552,35 +389,15 @@ class AgentClient:
                     return
 
         # Create FollowerConfig from deploy config
-        from src.config import FollowerConfig
-        cfg = FollowerConfig(
-            name=config.get("name", self._agent_name),
-            path=config.get("path", "C:\\Program Files\\MetaTrader 5\\terminal64.exe"),
-            port=port,
-            login=login,
-            password=config.get("password", ""),
-            server=config.get("server", ""),
-            lot_multiplier=lot_multiplier,
-            max_lot=_parse_float(config.get("max_lot", 1.0), "max_lot", minv=0.0),
-            min_lot=min_lot,
-            max_positions=max_positions,
-            deviation=deviation,
-            magic=magic,
-            skip_own_magic=_parse_bool(config.get("skip_own_magic", True), True),
-            symbol_mapping=symbol_mapping,
-            skip_auto_trading=_parse_bool(config.get("skip_auto_trading", True), True),
-            terminal_data_path=config.get("terminal_data_path", ""),
-            max_daily_loss=max_daily_loss,
-            max_drawdown_pct=max_drawdown_pct,
-            max_daily_trades=max_daily_trades,
-            queue_path=queue_path,
+        cfg = config_push.build_follower_config(
+            config, values, agent_name=self._agent_name,
         )
 
         self._follower_cfg = cfg
         self._executor = FollowerExecutor(cfg)
         self._configured = True
         # Replace seq-file location now that we know the real queue path
-        self._seq_path = self._event_store_path or (queue_path + ".seq")
+        self._seq_path = self._event_store_path or (values.queue_path + ".seq")
         self._config_save_path = config_path
 
         # Update agent name if provided

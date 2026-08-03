@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import json
 import logging
 import os
@@ -10,7 +9,6 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
-from ctypes import wintypes
 from typing import Optional
 
 try:
@@ -38,165 +36,9 @@ except ImportError:
 
 from src.config import FollowerConfig
 from src.models import TradeEvent
+from src import terminal_ui
 
 logger = logging.getLogger(__name__)
-
-# Windows API user32.dll — used by _wait_for_terminal_window
-_user32 = ctypes.WinDLL('user32', use_last_error=True)
-
-
-_WM_COMMAND = 0x0111
-_WM_CLOSE = 0x0010
-_WM_DESTROY = 0x0002
-_WM_KEYDOWN = 0x0100
-_WM_KEYUP = 0x0101
-_VK_ESCAPE = 27
-_VK_RETURN = 13
-_ALGO_CMD_IDS = (33051, 33050, 33052, 32808)  # known MT5 Algo command IDs
-
-
-def _dismiss_blocking_dialogs(name: str, main_hwnd: int) -> None:
-    """Close any visible modal dialogs (Login, connection prompts) that
-    belong to the same process as main_hwnd and might block input.
-
-    Uses multiple approaches:
-    - WM_CLOSE (standard close)
-    - WM_COMMAND(IDCANCEL=2) (dialog cancel button)
-    - WM_DESTROY (forceful destroy)
-    - Simulated Escape key (WM_KEYDOWN/WM_KEYUP)
-    - Simulated Enter key (to press default OK button)
-    """
-    from ctypes import wintypes as _wt
-    _GetWindowThreadProcessId = _user32.GetWindowThreadProcessId
-    _GetWindowThreadProcessId.argtypes = [_wt.HWND, ctypes.POINTER(_wt.DWORD)]
-    _GetWindowThreadProcessId.restype = _wt.DWORD
-
-    # Get the PID of the main window
-    pid = _wt.DWORD()
-    _GetWindowThreadProcessId(main_hwnd, ctypes.byref(pid))
-    target_pid = pid.value
-
-    if not target_pid:
-        return
-
-    _PostMessageW = _user32.PostMessageW
-    _PostMessageW.argtypes = [_wt.HWND, _wt.UINT, _wt.WPARAM, _wt.LPARAM]
-    _PostMessageW.restype = _wt.BOOL
-    _GetWindowTextW = _user32.GetWindowTextW
-    _GetClassNameW = _user32.GetClassNameW
-    _IsWindowVisible = _user32.IsWindowVisible
-    _title_buf = ctypes.create_unicode_buffer(256)
-    _class_buf = ctypes.create_unicode_buffer(256)
-    _pid_buf = _wt.DWORD()
-
-    _target_pid_ref = [target_pid]
-    _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, _wt.HWND, _wt.LPARAM)
-
-    def _close_proc(hwnd, lparam):
-        _GetWindowThreadProcessId(hwnd, ctypes.byref(_pid_buf))
-        if _pid_buf.value != _target_pid_ref[0]:
-            return 1
-        _GetClassNameW(hwnd, _class_buf, 256)
-        cls = _class_buf.value
-        # Class #32770 = standard dialog window
-        if cls == '#32770':
-            _GetWindowTextW(hwnd, _title_buf, 256)
-            title = _title_buf.value
-            if not _IsWindowVisible(hwnd):
-                return 1
-            logger.info(
-                "%s: closing visible dialog hwnd=%d title='%s'",
-                name, hwnd, title,
-            )
-            # Fire ALL close mechanisms at once (best effort)
-            _PostMessageW(hwnd, _WM_CLOSE, 0, 0)       # standard close
-            _PostMessageW(hwnd, _WM_COMMAND, 2, 0)     # IDCANCEL
-            _PostMessageW(hwnd, _WM_DESTROY, 0, 0)     # forceful destroy
-            _PostMessageW(hwnd, _WM_KEYDOWN, _VK_ESCAPE, 0)  # Esc key press
-            _PostMessageW(hwnd, _WM_KEYUP, _VK_ESCAPE, 0)    # Esc key release
-            _PostMessageW(hwnd, _WM_KEYDOWN, _VK_RETURN, 0)  # Enter key press
-            _PostMessageW(hwnd, _WM_KEYUP, _VK_RETURN, 0)    # Enter key release
-        return 1
-
-    cb = _WNDENUMPROC(_close_proc)
-    _user32.EnumWindows(cb, 0)
-
-
-def _toggle_algo_via_wm_command(hwnd: int) -> bool:
-    """Toggle the Algo button by sending WM_COMMAND directly.
-
-    Sends WM_COMMAND messages with known Algo button command IDs
-    directly to the main MetaTrader frame window via PostMessageW.
-    This bypasses keyboard/focus/foreground issues — it works even
-    when the window is not in the foreground.
-    """
-    from ctypes import wintypes as _wt
-    _PostMessageW = _user32.PostMessageW
-    _PostMessageW.argtypes = [_wt.HWND, _wt.UINT, _wt.WPARAM, _wt.LPARAM]
-    _PostMessageW.restype = _wt.BOOL
-
-    sent_any = False
-    for cmd_id in _ALGO_CMD_IDS:
-        # Send multiple times to ensure delivery
-        for _ in range(3):
-            result = _PostMessageW(hwnd, _WM_COMMAND, cmd_id, 0)
-            if result:
-                sent_any = True
-        if sent_any:
-            logger.info("Sent WM_COMMAND %d to hwnd=%d", cmd_id, hwnd)
-    return sent_any
-
-
-def _send_ctrl_e_via_powershell(pid: int, hwnd: int = 0) -> None:
-    """Send Ctrl+E via PowerShell SetForegroundWindow+SendKeys.
-
-    WARNING: This brings the terminal window to the foreground (intrusive).
-    Only use as LAST resort when WM_COMMAND doesn't work.
-    """
-    if hwnd:
-        ps_script = (
-            "Add-Type -AssemblyName System.Windows.Forms;"
-            "$def = '[DllImport(\"user32.dll\")]"
-            "public static extern bool SetForegroundWindow(IntPtr hWnd);';"
-            "Add-Type -MemberDefinition $def -Name W32 -Namespace W;"
-            "[W.W32]::SetForegroundWindow([IntPtr]%d);"
-            "Start-Sleep -Milliseconds 500;"
-            "[System.Windows.Forms.SendKeys]::SendWait('^(e)');"
-            "Start-Sleep -Milliseconds 1000;"
-            "[System.Windows.Forms.SendKeys]::SendWait('^(e)');"
-            "Start-Sleep -Milliseconds 1000;"
-            "[System.Windows.Forms.SendKeys]::SendWait('^(e)');"
-            "Write-Output 'OK';"
-        ) % hwnd
-    else:
-        # Fallback: AppActivate by PID
-        ps_script = (
-            "Add-Type -AssemblyName System.Windows.Forms;"
-            "Add-Type -AssemblyName Microsoft.VisualBasic;"
-            "try {"
-            "  [Microsoft.VisualBasic.Interaction]::AppActivate(%d);"
-            "  Start-Sleep -Milliseconds 500;"
-            "  [System.Windows.Forms.SendKeys]::SendWait('^(e)');"
-            "  Start-Sleep -Milliseconds 1000;"
-            "  [System.Windows.Forms.SendKeys]::SendWait('^(e)');"
-            "  Start-Sleep -Milliseconds 1000;"
-            "  [System.Windows.Forms.SendKeys]::SendWait('^(e)');"
-            "  Write-Output 'OK';"
-            "} catch { Write-Error $_.Exception.Message; }"
-        ) % pid
-    import subprocess as _sp
-    try:
-        result = _sp.check_output(
-            ['powershell', '-STA', '-ExecutionPolicy', 'Bypass',
-             '-Command', ps_script],
-            timeout=15, stderr=_sp.STDOUT,
-        )
-        logger.info(
-            "PowerShell SendKeys result: %s",
-            result.decode('utf-8', errors='replace').strip(),
-        )
-    except Exception as e:
-        logger.warning("PowerShell SendKeys failed: %s", e)
 
 
 class FollowerExecutor:
@@ -287,86 +129,126 @@ class FollowerExecutor:
 
         The Algo button cannot be enabled via config files — it must be
         toggled via Ctrl+E in a visible terminal window. This method:
-        1. Kills any existing hidden terminal (started by mt5.initialize)
-        2. Starts the terminal VISIBLY
-        3. Waits for the window to appear
-        4. Sends Ctrl+E to toggle the Algo button
-        5. Verifies trade_allowed=True
+        1. Checks whether auto-trading is already on (no window needed)
+        2. Tries a programmatic login (seeded session — no UI needed)
+        3. Falls back to the visible-window dance: kill the hidden
+           terminal, start ours visibly, wait for the window, toggle the
+           Algo button (WM_COMMAND first, Ctrl+E via PowerShell as retry),
+           and verify trade_allowed=True.
+
+        The visible-window UI automation itself lives in src/terminal_ui.py;
+        this method only orchestrates it with the MT5 API.
         """
         logger.info("%s: ensuring auto-trading is enabled...", self._name)
 
-        # First check if auto-trading is already enabled (no window needed)
-        init_ok = mt5.initialize(path=self._cfg.path, port=self._cfg.port, timeout=5000)
-        if init_ok:
-            ti = mt5.terminal_info()
-            if ti and ti.trade_allowed:
-                logger.info(
-                    "%s: auto-trading already enabled (trade_allowed=True)",
-                    self._name,
-                )
-                mt5.shutdown()
-                return True
-            mt5.shutdown()
+        if self._mt5_trade_allowed_initial():
+            return True
 
         # Programmatic login FIRST: a terminal with a seeded session can be
         # bootstrapped purely via the API (mt5.initialize with credentials),
         # which avoids the fragile visible-window UI automation entirely. The
         # UI dance below is only a fallback for when programmatic login fails
         # (e.g. brand-new install with no account session at all).
-        if self._cfg.login:
-            init_ok = mt5.initialize(
-                path=self._cfg.path,
-                port=self._cfg.port,
-                login=self._cfg.login,
-                password=self._cfg.password,
-                server=self._cfg.server,
-                timeout=15000,
-            )
-            if init_ok:
-                ti = mt5.terminal_info()
-                trade_ok = ti.trade_allowed if ti else False
-                if trade_ok:
-                    logger.info(
-                        "%s: auto-trading enabled via programmatic login "
-                        "(trade_allowed=True)",
-                        self._name,
-                    )
-                    mt5.shutdown()
-                    return True
-                mt5.shutdown()
-                if self._cfg.skip_auto_trading:
-                    logger.warning(
-                        "%s: programmatic login ok but trade_allowed=%s, "
-                        "skip_auto_trading=True — proceeding anyway",
-                        self._name, trade_ok,
-                    )
-                    return True
-                logger.warning(
-                    "%s: programmatic login ok but trade_allowed=%s — "
-                    "falling back to UI toggle",
-                    self._name, trade_ok,
-                )
-            else:
-                logger.warning(
-                    "%s: programmatic login failed: %s — falling back to UI toggle",
-                    self._name, mt5.last_error(),
-                )
-
-        import subprocess as _sp
+        if self._cfg.login and self._enable_via_api_login():
+            return True
 
         # Up to 3 attempts to ensure the terminal runs with a visible window
+        hwnd = self._ensure_visible_terminal_window()
+        if hwnd is None:
+            logger.error("%s: terminal window not found after 3 attempts", self._name)
+            return False
+
+        # Small extra wait for the window to fully initialise
+        time.sleep(2.0)
+
+        # Dismiss any modal dialogs (Login, connection prompts) that might
+        # block the main window from processing commands.
+        terminal_ui.dismiss_blocking_dialogs(self._name, hwnd)
+
+        # Find the process so the Ctrl+E fallback can target it by PID.
+        our_pid = terminal_ui.find_terminal_pid(self._exe_path)
+        if our_pid is None:
+            logger.error("%s: terminal PID not found after window appeared", self._name)
+            return False
+
+        return self._toggle_algo_and_verify(hwnd, our_pid)
+
+    def _mt5_trade_allowed_initial(self) -> bool:
+        """True if auto-trading is already on (no visible window needed)."""
+        init_ok = mt5.initialize(path=self._cfg.path, port=self._cfg.port, timeout=5000)
+        if not init_ok:
+            return False
+        try:
+            ti = mt5.terminal_info()
+            if ti and ti.trade_allowed:
+                logger.info(
+                    "%s: auto-trading already enabled (trade_allowed=True)",
+                    self._name,
+                )
+                return True
+        finally:
+            mt5.shutdown()
+        return False
+
+    def _enable_via_api_login(self) -> bool:
+        """Try enabling auto-trading purely via the API (no UI).
+
+        Returns True when the follower is now ready to trade (trade_allowed
+        or skip_auto_trading); False means the UI fallback is required.
+        """
+        init_ok = mt5.initialize(
+            path=self._cfg.path,
+            port=self._cfg.port,
+            login=self._cfg.login,
+            password=self._cfg.password,
+            server=self._cfg.server,
+            timeout=15000,
+        )
+        if not init_ok:
+            logger.warning(
+                "%s: programmatic login failed: %s", self._name, mt5.last_error(),
+            )
+            return False
+        try:
+            ti = mt5.terminal_info()
+            trade_ok = ti.trade_allowed if ti else False
+            if trade_ok:
+                logger.info(
+                    "%s: auto-trading enabled via programmatic login "
+                    "(trade_allowed=True)",
+                    self._name,
+                )
+                return True
+            if self._cfg.skip_auto_trading:
+                logger.warning(
+                    "%s: programmatic login ok but trade_allowed=%s, "
+                    "skip_auto_trading=True — proceeding anyway",
+                    self._name, trade_ok,
+                )
+                return True
+            logger.warning(
+                "%s: programmatic login ok but trade_allowed=%s",
+                self._name, trade_ok,
+            )
+            return False
+        finally:
+            mt5.shutdown()
+
+    def _ensure_visible_terminal_window(self) -> Optional[int]:
+        """Kill any hidden terminal and start ours visibly, up to 3 attempts.
+
+        Returns the terminal's main-frame hwnd, or None if no window could
+        be obtained. Window enumeration lives in src/terminal_ui.py.
+        """
         for attempt in range(1, 4):
             # Step 1: kill only the terminal64.exe matching OUR path
-            our_pid = self._find_terminal_pid()
+            our_pid = terminal_ui.find_terminal_pid(self._exe_path)
             if our_pid is not None:
                 logger.info(
                     "%s: killing terminal PID %d (attempt %d/3)...",
                     self._name, our_pid, attempt,
                 )
-                _sp.call(
-                    ['taskkill', '/F', '/PID', str(our_pid)],
-                    timeout=5, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-                )
+                terminal_ui.kill_terminal(our_pid)
                 # Small wait for process cleanup
                 time.sleep(2.0)
             else:
@@ -385,7 +267,7 @@ class FollowerExecutor:
                     self._name, attempt,
                 )
                 # shell=True ensures the window is visible (GUI process)
-                _sp.Popen([self._exe_path, login_str], shell=True)
+                subprocess.Popen([self._exe_path, login_str], shell=True)
             except Exception as e:
                 logger.error(
                     "%s: failed to start terminal visibly: %s", self._name, e,
@@ -393,38 +275,34 @@ class FollowerExecutor:
                 continue
 
             # Step 3: wait for any window belonging to the terminal process
-            hwnd = self._wait_for_terminal_window(timeout=15.0)
+            hwnd = terminal_ui.wait_for_terminal_window(
+                self._exe_path, self._name, timeout=15.0,
+            )
             if hwnd is not None:
                 logger.info(
                     "%s: terminal window found (hwnd=%d)", self._name, hwnd,
                 )
-                break
+                return hwnd
             logger.warning(
                 "%s: terminal window not found within 15s (attempt %d/3)",
                 self._name, attempt,
             )
-        else:
-            logger.error("%s: terminal window not found after 3 attempts", self._name)
-            return False
+        return None
 
-        # Small extra wait for the window to fully initialise
-        time.sleep(2.0)
+    def _toggle_algo_and_verify(self, hwnd: int, our_pid: int) -> bool:
+        """Toggle the Algo button on a visible terminal and verify it.
 
-        # Step 3b: dismiss any modal dialogs (Login, connection prompts)
-        # that might block the main window from processing commands
-        _dismiss_blocking_dialogs(self._name, hwnd)
-
-        # Step 4a: try WM_COMMAND first (non-intrusive, no flash/focus steal)
-        our_pid = self._find_terminal_pid()
-        if our_pid is None:
-            logger.error("%s: terminal PID not found after window appeared", self._name)
-            return False
+        Uses WM_COMMAND first (non-intrusive), then verifies via the MT5
+        API; if trade_allowed is still False, sends Ctrl+E via PowerShell
+        and re-verifies once.
+        """
         logger.info(
             "%s: sending WM_COMMAND algo toggle (hwnd=%d)...",
             self._name, hwnd,
         )
-        wm_worked = _toggle_algo_via_wm_command(hwnd)
-        # Step 5: connect to the EXISTING visible terminal (WITHOUT login first)
+        terminal_ui.toggle_algo_via_wm_command(hwnd)
+
+        # Connect to the EXISTING visible terminal (WITHOUT login first)
         init_ok = mt5.initialize(
             path=self._cfg.path,
             port=self._cfg.port,
@@ -436,238 +314,68 @@ class FollowerExecutor:
                 self._name, mt5.last_error(),
             )
             mt5.shutdown()
-        else:
-            # Now login to switch accounts
-            login_ok = mt5.login(
-                login=self._cfg.login,
-                password=self._cfg.password,
-                server=self._cfg.server,
+        elif self._login_and_check():
+            return True
+
+        # Retry: send Ctrl+E once more and recheck
+        logger.info("%s: sending Ctrl+E again and retrying...", self._name)
+        terminal_ui.send_ctrl_e_via_powershell(our_pid, hwnd)
+        time.sleep(1.5)
+
+        retry_ok = mt5.initialize(
+            path=self._cfg.path,
+            port=self._cfg.port,
+            timeout=10000,
+        )
+        if not retry_ok:
+            logger.error(
+                "%s: retry mt5.initialize() failed: %s", self._name, mt5.last_error(),
             )
-            if not login_ok:
-                logger.error(
-                    "%s: mt5.login() failed: %s", self._name, mt5.last_error(),
-                )
-                mt5.shutdown()
-            else:
-                # Verify trade_allowed BEFORE shutting down — calling
-                # terminal_info() after shutdown always returns None.
-                ti = mt5.terminal_info()
-                if ti and ti.trade_allowed:
-                    logger.info(
-                        "%s: auto-trading ENABLED (trade_allowed=True)",
-                        self._name,
-                    )
-                    mt5.shutdown()
-                    return True
-                elif ti:
-                    logger.warning(
-                        "%s: trade_allowed=%s after visible start, retrying...",
-                        self._name, ti.trade_allowed,
-                    )
-                else:
-                    logger.warning(
-                        "%s: terminal_info() returned None", self._name,
-                    )
-                mt5.shutdown()
-
-            # Retry: send Ctrl+E once more and recheck
-            logger.info("%s: sending Ctrl+E again and retrying...", self._name)
-            _send_ctrl_e_via_powershell(our_pid, hwnd)
-            time.sleep(1.5)
-
-            retry_ok = mt5.initialize(
-                path=self._cfg.path,
-                port=self._cfg.port,
-                timeout=10000,
+            mt5.shutdown()
+            return False
+        if self._login_and_check():
+            logger.info(
+                "%s: auto-trading ENABLED after 2nd SendKeys", self._name,
             )
-            if not retry_ok:
-                logger.error(
-                    "%s: retry mt5.initialize() failed: %s", self._name, mt5.last_error(),
-                )
-                mt5.shutdown()
-            else:
-                retry_login = mt5.login(
-                    login=self._cfg.login,
-                    password=self._cfg.password,
-                    server=self._cfg.server,
-                )
-                if not retry_login:
-                    logger.error(
-                        "%s: retry mt5.login() failed: %s", self._name, mt5.last_error(),
-                    )
-                    mt5.shutdown()
-                else:
-                    # Verify BEFORE shutting down (terminal_info after shutdown
-                    # is always None -> spurious "still False" warning).
-                    ti2 = mt5.terminal_info()
-                    if ti2 and ti2.trade_allowed:
-                        logger.info(
-                            "%s: auto-trading ENABLED after 2nd SendKeys",
-                            self._name,
-                        )
-                        mt5.shutdown()
-                        return True
-                    logger.warning(
-                        "%s: trade_allowed still False after 2nd SendKeys (val=%s)",
-                        self._name, ti2.trade_allowed if ti2 else 'N/A',
-                    )
-                    mt5.shutdown()
-
+            return True
         logger.error("%s: could NOT enable auto-trading", self._name)
         return False
 
-    def _find_terminal_pid(self) -> Optional[int]:
-        """Return PID of running terminal64.exe that matches our path, or None.
+    def _login_and_check(self) -> bool:
+        """mt5.login() then verify trade_allowed (checked before shutdown).
 
-        Uses WMIC without shell=True for reliable execution.
+        Returns True when trade_allowed is on. A failed login or a False
+        trade_allowed both return False and leave the terminal state for
+        the next attempt.
         """
-        import subprocess as _sp
+        login_ok = mt5.login(
+            login=self._cfg.login,
+            password=self._cfg.password,
+            server=self._cfg.server,
+        )
+        if not login_ok:
+            logger.error(
+                "%s: mt5.login() failed: %s", self._name, mt5.last_error(),
+            )
+            mt5.shutdown()
+            return False
         try:
-            output = _sp.check_output(
-                ['wmic', 'process', 'where', "name='terminal64.exe'",
-                 'get', 'processid,executablepath', '/format:csv'],
-                timeout=5,
-            ).decode('utf-8', errors='replace')
-            # Parse CSV lines; first line is header, second may be blank
-            for line in output.strip().split('\n'):
-                line = line.strip()
-                if not line or line.startswith('Node'):
-                    continue
-                parts = line.split(',')
-                if len(parts) >= 3:
-                    exe_path = parts[-2].strip()
-                    pid_str = parts[-1].strip()
-                    if exe_path and pid_str and pid_str.isdigit():
-                        # Normalize both paths for comparison
-                        our_path = self._exe_path.replace('/', '\\').lower()
-                        if our_path in exe_path.lower():
-                            logger.debug(
-                                "%s: found terminal PID %s at %s",
-                                self._name, pid_str, exe_path,
-                            )
-                            return int(pid_str)
-        except Exception as e:
-            logger.debug("%s: wmic lookup failed: %s", self._name, e)
-        return None
-
-    def _wait_for_terminal_window(self, timeout: float = 20.0) -> Optional[int]:
-        """Wait for any visible top-level window belonging to terminal64.exe.
-
-        More robust than FindWindowW by class name — enumerates all top-level
-        windows and checks each one's owning process via GetWindowThreadProcessId.
-        """
-        from ctypes import wintypes as _wt
-
-        _GetWindowThreadProcessId = _user32.GetWindowThreadProcessId
-        _GetWindowThreadProcessId.argtypes = [_wt.HWND, ctypes.POINTER(_wt.DWORD)]
-        _GetWindowThreadProcessId.restype = _wt.DWORD
-        _IsWindowVisible = _user32.IsWindowVisible
-        _IsWindowVisible.argtypes = [_wt.HWND]
-        _IsWindowVisible.restype = _wt.BOOL
-
-        def _get_terminal_pids() -> list:
-            """Return list of PIDs of terminal64.exe matching our path."""
-            pids = []
-            our_path = self._exe_path.replace('/', '\\').lower()
-            try:
-                import subprocess as _sp
-                out = _sp.check_output(
-                    ['wmic', 'process', 'where', "name='terminal64.exe'",
-                     'get', 'processid,executablepath', '/format:csv'],
-                    timeout=5,
-                )
-                out = out.decode('utf-8', errors='replace')
-                for line in out.strip().split('\n'):
-                    line = line.strip()
-                    if not line or line.startswith('Node'):
-                        continue
-                    parts = line.split(',')
-                    if len(parts) >= 3:
-                        exe_path = parts[-2].strip()
-                        pid_str = parts[-1].strip()
-                        if exe_path and pid_str and pid_str.isdigit():
-                            if our_path in exe_path.lower():
-                                pids.append(int(pid_str))
-            except Exception:
-                pass
-            return pids
-
-        # Callback for EnumWindows — uses outer-scope pids/hwnd variables
-        _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, _wt.HWND, _wt.LPARAM)
-        _pid_buf = _wt.DWORD()
-        _title_buf = ctypes.create_unicode_buffer(256)
-        _class_buf = ctypes.create_unicode_buffer(256)
-        _GetClassNameW = _user32.GetClassNameW
-        _GetClassNameW.argtypes = [_wt.HWND, ctypes.c_wchar_p, ctypes.c_int]
-        _GetClassNameW.restype = ctypes.c_int
-
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            terminal_pids = _get_terminal_pids()
-            if not terminal_pids:
-                time.sleep(0.5)
-                continue
-
-            found_metatrader = [None]  # mutable container for closure
-            found_any = [None]  # any non-trash window as fallback
-
-            def _enum_proc(hwnd, lparam):
-                _GetWindowThreadProcessId(hwnd, ctypes.byref(_pid_buf))
-                if _pid_buf.value in terminal_pids:
-                    # Get title and class
-                    _user32.GetWindowTextW(hwnd, _title_buf, 256)
-                    _GetClassNameW(hwnd, _class_buf, 256)
-                    title = _title_buf.value
-                    cls = _class_buf.value
-                    logger.info(
-                        "%s: found terminal window hwnd=%d title='%s' class='%s'",
-                        self._name, hwnd, title, cls,
-                    )
-                    # Ignore GDI+ hook, IME, and tooltip windows (not real UI)
-                    if cls.startswith(('GDI+', 'tooltips_class32', 'MSCTFIME UI', 'ComboLBox')):
-                        return 1
-                    if cls == 'IME':
-                        return 1
-                    # Show the window if hidden
-                    if not _IsWindowVisible(hwnd):
-                        _user32.ShowWindow(hwnd, 1)  # SW_SHOWNORMAL
-                    # MetaTrader class = main frame window (what we want)
-                    if 'MetaTrader' in cls or 'MetaTrader' in title:
-                        if found_metatrader[0] is None:
-                            found_metatrader[0] = hwnd
-                    # First non-trash window as fallback
-                    if found_any[0] is None:
-                        found_any[0] = hwnd
-                return 1
-
-            cb = _WNDENUMPROC(_enum_proc)
-            _user32.EnumWindows(cb, 0)
-
-            # If we found a MetaTrader class window, return immediately
-            if found_metatrader[0] is not None:
+            # Verify BEFORE shutting down — calling terminal_info() after
+            # shutdown always returns None.
+            ti = mt5.terminal_info()
+            if ti and ti.trade_allowed:
                 logger.info(
-                    "%s: selected main frame window hwnd=%d",
-                    self._name, found_metatrader[0],
+                    "%s: auto-trading ENABLED (trade_allowed=True)",
+                    self._name,
                 )
-                return found_metatrader[0]
-
-            # Keep polling — don't return a fallback until deadline
-            remaining = deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(min(0.5, max(0.1, remaining)))
-                continue
-
-            # Deadline reached — use fallback if available
-            if found_any[0] is not None:
-                logger.info(
-                    "%s: deadline reached, using fallback window hwnd=%d",
-                    self._name, found_any[0],
-                )
-                return found_any[0]
-
-            time.sleep(0.5)
-
-        return None
+                return True
+            logger.warning(
+                "%s: trade_allowed=%s after visible start",
+                self._name, ti.trade_allowed if ti else 'N/A',
+            )
+            return False
+        finally:
+            mt5.shutdown()
 
     def connect(self, master_port: int = 0) -> bool:
         """Initialize MT5 API connection to THIS follower's OWN terminal.
